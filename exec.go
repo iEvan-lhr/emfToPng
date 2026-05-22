@@ -111,3 +111,9 @@ func ConvertEMFToPNGStream(r io.Reader, w io.Writer) error {
 
 	return png.Encode(w, img)
 }
+
+// ConvertEmfToPng converts a byte slice of EMF data to a byte slice of PNG data.
+// This is a convenient wrapper matching the user's preferred naming.
+func ConvertEmfToPng(fdata []byte) ([]byte, error) {
+	return ConvertEMFToPNGBytes(fdata)
+}
