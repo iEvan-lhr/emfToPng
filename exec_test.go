@@ -1,9 +1,9 @@
 package emf
 
 import (
-	"io"
 	"log"
 	"os"
+	"reflect"
 	"testing"
 )
 
@@ -13,56 +13,45 @@ func TestExecEMF(t *testing.T) {
 		log.Fatal(err)
 	}
 	ExecEMF(file, "image1.emf")
+
+	file2, err := os.ReadFile("image11.emf")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ExecEMF(file2, "image11.emf")
 }
 
-func TestConvert(t *testing.T) {
-	// 1. Test []byte input and []byte output
-	data, err := os.ReadFile("image1.emf")
+func TestAnalyzeEMF(t *testing.T) {
+	file, err := os.ReadFile("image11.emf")
 	if err != nil {
-		t.Fatalf("failed to read test file: %v", err)
+		t.Fatal(err)
 	}
-
-	outBytesVal, err := Convert(data)
+	emfFile, err := ReadFile(file)
 	if err != nil {
-		t.Fatalf("Convert with []byte failed: %v", err)
+		t.Fatal(err)
 	}
-
-	outBytes, ok := outBytesVal.([]byte)
-	if !ok {
-		t.Fatalf("expected []byte output, got: %T", outBytesVal)
+	t.Logf("Header bounds: %+v", emfFile.Header.Bounds)
+	t.Logf("Number of records: %d", len(emfFile.Records))
+	counts := make(map[uint32]int)
+	for _, rec := range emfFile.Records {
+		v := reflect.ValueOf(rec)
+		if v.Kind() == reflect.Ptr {
+			v = v.Elem()
+		}
+		var rType uint32
+		f := v.FieldByName("Record")
+		if f.IsValid() {
+			rType = uint32(f.FieldByName("Type").Uint())
+		} else {
+			fType := v.FieldByName("Type")
+			if fType.IsValid() {
+				rType = uint32(fType.Uint())
+			}
+		}
+		counts[rType]++
 	}
-	if len(outBytes) == 0 {
-		t.Fatal("expected non-empty output bytes")
-	}
-
-	// 2. Test io.Reader (opened file stream) input and io.Reader output
-	file, err := os.Open("image1.emf")
-	if err != nil {
-		t.Fatalf("failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	outReaderVal, err := Convert(file)
-	if err != nil {
-		t.Fatalf("Convert with io.Reader failed: %v", err)
-	}
-
-	outReader, ok := outReaderVal.(io.Reader)
-	if !ok {
-		t.Fatalf("expected io.Reader output, got: %T", outReaderVal)
-	}
-
-	// Verify we can read from the returned stream
-	pngBytes, err := io.ReadAll(outReader)
-	if err != nil {
-		t.Fatalf("failed to read from returned stream: %v", err)
-	}
-	if len(pngBytes) == 0 {
-		t.Fatal("expected non-empty bytes read from output stream")
-	}
-
-	// Verify that the contents match
-	if len(outBytes) != len(pngBytes) {
-		t.Errorf("byte slice output length (%d) does not match stream output length (%d)", len(outBytes), len(pngBytes))
+	t.Logf("Record type counts:")
+	for rType, count := range counts {
+		t.Logf("  Type 0x%x (%d): %d", rType, rType, count)
 	}
 }

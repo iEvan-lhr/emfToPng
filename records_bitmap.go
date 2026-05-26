@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 	_ "image/jpeg"
 	_ "image/png"
@@ -28,8 +29,9 @@ type bitmapRecord struct {
 	// only for EMR_STRETCHBLT
 	cxSrc, cySrc int32
 
-	BmiSrc  BitmapInfoHeader
-	BitsSrc []byte
+	BmiSrc     BitmapInfoHeader
+	ColorTable []byte
+	BitsSrc    []byte
 }
 
 // unified reader function for EMR_BITBLT and EMR_STRETCHBLT
@@ -124,14 +126,44 @@ func (r *bitmapRecord) read(reader *bytes.Reader) (Recorder, error) {
 		return nil, err
 	}
 
-	// skipping UndefinedSpace2
-	reader.Seek(int64(r.offBitsSrc-rsize-r.BmiSrc.HeaderSize), io.SeekCurrent)
+	// Read ColorTable
+	colorTableSize := int64(r.offBitsSrc) - int64(r.offBmiSrc) - 40
+	if colorTableSize > 0 {
+		r.ColorTable = make([]byte, colorTableSize)
+		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+			return nil, err
+		}
+	}
+
 	r.BitsSrc = make([]byte, r.cbBitsSrc)
-	if _, err := reader.Read(r.BitsSrc); err != nil {
+	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
 		return nil, err
 	}
 
 	return r, nil
+}
+
+func (r *bitmapRecord) getColor(idx int) color.RGBA {
+	offset := idx * 4
+	if offset+3 < len(r.ColorTable) {
+		return color.RGBA{
+			R: r.ColorTable[offset+2],
+			G: r.ColorTable[offset+1],
+			B: r.ColorTable[offset+0],
+			A: 0xff,
+		}
+	}
+	if r.BmiSrc.BitCount == BI_BITCOUNT_1 {
+		if idx == 0 {
+			return color.RGBA{0, 0, 0, 0}
+		}
+		return color.RGBA{255, 255, 255, 0xff}
+	}
+	val := uint8(idx)
+	if r.BmiSrc.BitCount == BI_BITCOUNT_2 {
+		val = uint8(idx * 17)
+	}
+	return color.RGBA{val, val, val, 0xff}
 }
 
 func (r *bitmapRecord) readImage() image.Image {
@@ -152,6 +184,7 @@ func (r *bitmapRecord) readImage() image.Image {
 	// bytes per pixel
 	bpp, ok := map[uint16]int{
 		BI_BITCOUNT_1: 0,
+		BI_BITCOUNT_2: 0,
 		BI_BITCOUNT_3: 1,
 		BI_BITCOUNT_5: 3,
 		BI_BITCOUNT_4: 2,
@@ -171,37 +204,57 @@ func (r *bitmapRecord) readImage() image.Image {
 	switch r.BmiSrc.BitCount {
 	case BI_BITCOUNT_1:
 		img := image.NewRGBA(image.Rect(0, 0, width, height))
-		// we don't read it
-		colors := map[int][]byte{0: {0, 0, 0, 0}, 1: {255, 255, 255, 0}}
-
 		mask := []byte{0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01}
 
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
 				p := img.PixOffset(x, height-y-1)
-				c := colors[0]
+				idx := 0
 				if (r.BitsSrc[y*bpl+x/8] & mask[x%8]) > 0 {
-					c = colors[1]
+					idx = 1
 				}
-				img.Pix[p+0] = c[2]
-				img.Pix[p+1] = c[1]
-				img.Pix[p+2] = c[0]
+				c := r.getColor(idx)
+				img.Pix[p+0] = c.R
+				img.Pix[p+1] = c.G
+				img.Pix[p+2] = c.B
+				img.Pix[p+3] = 0xff
+			}
+		}
+		return img
+
+	case BI_BITCOUNT_2:
+		img := image.NewRGBA(image.Rect(0, 0, width, height))
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				p := img.PixOffset(x, height-y-1)
+				byteVal := r.BitsSrc[y*bpl+x/2]
+				var idx int
+				if x%2 == 0 {
+					idx = int((byteVal >> 4) & 0x0f)
+				} else {
+					idx = int(byteVal & 0x0f)
+				}
+				c := r.getColor(idx)
+				img.Pix[p+0] = c.R
+				img.Pix[p+1] = c.G
+				img.Pix[p+2] = c.B
 				img.Pix[p+3] = 0xff
 			}
 		}
 		return img
 
 	case BI_BITCOUNT_3:
-		img := image.NewGray(image.Rect(0, 0, width, height))
-		ix := 0
-		// BMP images are stored bottom-up
-		for y := height - 1; y >= 0; y-- {
-			b := r.BitsSrc[y*bpl : y*bpl+bpl]
-			p := img.Pix[ix*img.Stride : ix*img.Stride+img.Stride]
-			for i, j := 0, 0; i < len(p); i, j = i+1, j+bpp {
-				p[i] = b[j]
+		img := image.NewRGBA(image.Rect(0, 0, width, height))
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				p := img.PixOffset(x, height-y-1)
+				idx := int(r.BitsSrc[y*bpl+x])
+				c := r.getColor(idx)
+				img.Pix[p+0] = c.R
+				img.Pix[p+1] = c.G
+				img.Pix[p+2] = c.B
+				img.Pix[p+3] = 0xff
 			}
-			ix = ix + 1
 		}
 		return img
 
@@ -374,12 +427,120 @@ func readStretchdibitsRecord(reader *bytes.Reader, size uint32) (Recorder, error
 		return nil, err
 	}
 
-	// skipping UndefinedSpace2
-	reader.Seek(int64(r.offBitsSrc-80-r.BmiSrc.HeaderSize), io.SeekCurrent)
+	// Read ColorTable
+	colorTableSize := int64(r.offBitsSrc) - int64(r.offBmiSrc) - 40
+	if colorTableSize > 0 {
+		r.ColorTable = make([]byte, colorTableSize)
+		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+			return nil, err
+		}
+	}
+
 	r.BitsSrc = make([]byte, r.cbBitsSrc)
-	if _, err := reader.Read(r.BitsSrc); err != nil {
+	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
 		return nil, err
 	}
 
 	return r, nil
+}
+
+type PatternBrushRecord struct {
+	Record
+	ihBrush    uint32
+	Usage      uint32
+	offBmi     uint32
+	cbBmi      uint32
+	offBits    uint32
+	cbBits     uint32
+	BmiSrc     BitmapInfoHeader
+	ColorTable []byte
+	BitsSrc    []byte
+}
+
+func readPatternBrushRecord(reader *bytes.Reader, size uint32, recType uint32) (Recorder, error) {
+	r := &PatternBrushRecord{}
+	r.Record = Record{Type: recType, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.ihBrush); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Usage); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.offBmi); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.cbBmi); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.offBits); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.cbBits); err != nil {
+		return nil, err
+	}
+
+	if r.offBmi == 0 {
+		return r, nil
+	}
+
+	// Seek to BmiSrc relative to the start of the record.
+	// The fields before BmiSrc are: Type (4), Size (4), ihBrush (4), Usage (4), offBmi (4), cbBmi (4), offBits (4), cbBits (4).
+	// Total size of these fields is 32 bytes.
+	// So we seek relative to 32.
+	reader.Seek(int64(r.offBmi-32), io.SeekCurrent)
+	if err := binary.Read(reader, binary.LittleEndian, &r.BmiSrc); err != nil {
+		return nil, err
+	}
+
+	// Read ColorTable and BitsSrc
+	colorTableSize := int64(r.offBits) - int64(r.offBmi) - 40
+	if colorTableSize > 0 {
+		r.ColorTable = make([]byte, colorTableSize)
+		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+			return nil, err
+		}
+	}
+
+	r.BitsSrc = make([]byte, r.cbBits)
+	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func readCreatemonobrushRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	return readPatternBrushRecord(reader, size, EMR_CREATEMONOBRUSH)
+}
+
+func readCreatedibpatternbrushptRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	return readPatternBrushRecord(reader, size, EMR_CREATEDIBPATTERNBRUSHPT)
+}
+
+func (r *PatternBrushRecord) Draw(ctx *context) {
+	ctx.objects[r.ihBrush] = r
+}
+
+func (r *PatternBrushRecord) getColor(idx int) color.RGBA {
+	offset := idx * 4
+	if offset+3 < len(r.ColorTable) {
+		return color.RGBA{
+			R: r.ColorTable[offset+2],
+			G: r.ColorTable[offset+1],
+			B: r.ColorTable[offset+0],
+			A: 0xff,
+		}
+	}
+	if r.BmiSrc.BitCount == BI_BITCOUNT_1 {
+		if idx == 0 {
+			return color.RGBA{0, 0, 0, 0}
+		}
+		return color.RGBA{255, 255, 255, 0xff}
+	}
+	val := uint8(idx)
+	if r.BmiSrc.BitCount == BI_BITCOUNT_2 {
+		val = uint8(idx * 17)
+	}
+	return color.RGBA{val, val, val, 0xff}
 }

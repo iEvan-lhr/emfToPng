@@ -369,7 +369,7 @@ func readSettextcolorRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 }
 
 func (r *SettextcolorRecord) Draw(ctx *context) {
-	ctx.SetFillColor(r.Color.GetColor())
+	ctx.textColor = r.Color.GetColor()
 }
 
 type SetbkcolorRecord struct {
@@ -389,7 +389,7 @@ func readSetbkcolorRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *SetbkcolorRecord) Draw(ctx *context) {
-	ctx.SetFillColor(r.Color.GetColor())
+	ctx.bkColor = r.Color.GetColor()
 }
 
 type MovetoexRecord struct {
@@ -597,13 +597,31 @@ func (r *SelectobjectRecord) Draw(ctx *context) {
 			ctx.SetFillColor(image.Transparent)
 		}
 	case LogPen:
-		ctx.SetLineWidth(float64(o.Width.X))
+		w := float64(o.Width.X)
+		if w <= 0 {
+			w = 1
+		}
+		ctx.SetLineWidth(w)
 		ctx.SetStrokeColor(o.ColorRef.GetColor())
 	case LogPenEx:
-		ctx.SetLineWidth(float64(o.Width))
+		w := float64(o.Width)
+		if w <= 0 {
+			w = 1
+		}
+		ctx.SetLineWidth(w)
 		ctx.SetStrokeColor(o.ColorRef.GetColor())
 	case LogBrushEx:
 		ctx.SetFillColor(o.Color.GetColor())
+	case *PatternBrushRecord:
+		if o.BmiSrc.BitCount == 1 {
+			ctx.SetFillColor(ctx.textColor)
+		} else {
+			c := o.getColor(1)
+			if c.A == 0 {
+				c = o.getColor(0)
+			}
+			ctx.SetFillColor(c)
+		}
 	case LogFont:
 		h := float64(o.Height)
 		if h < 0 {
@@ -982,7 +1000,34 @@ func readExttextoutwRecord(reader *bytes.Reader, size uint32) (Recorder, error) 
 func (r *ExttextoutwRecord) Draw(ctx *context) {
 	x := float64(r.wEmrText.Reference.X)
 	y := float64(r.wEmrText.Reference.Y)
-	ctx.FillStringAt(r.wEmrText.OutputString, x, y)
+
+	// Save CTM
+	tr := ctx.GetMatrixTransform()
+
+	// Map user coordinates (x, y) to device space (nx, ny)
+	nx := x*tr[0] + y*tr[2] + tr[4]
+	ny := x*tr[1] + y*tr[3] + tr[5]
+
+	// Get absolute scaling values
+	sx := math.Sqrt(tr[0]*tr[0] + tr[1]*tr[1])
+	sy := math.Sqrt(tr[2]*tr[2] + tr[3]*tr[3])
+
+	if sx < 0.0001 {
+		sx = 1.0
+	}
+	if sy < 0.0001 {
+		sy = 1.0
+	}
+
+	// Set upright CTM: no rotation, positive scales, translated to (nx, ny)
+	ctx.SetMatrixTransform([6]float64{sx, 0, 0, sy, nx, ny})
+
+	// Draw the string at (0, 0) using stored textColor
+	ctx.SetFillColor(ctx.textColor)
+	ctx.FillStringAt(r.wEmrText.OutputString, 0, 0)
+
+	// Restore CTM
+	ctx.SetMatrixTransform(tr)
 }
 
 type Polybezier16Record struct {
@@ -1307,12 +1352,12 @@ func readSeticmmodeRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_HEADER:                  readHeaderRecord,
 	EMR_POLYBEZIER:              nil,
-	EMR_POLYGON:                 nil,
-	EMR_POLYLINE:                nil,
+	EMR_POLYGON:                 readPolygonRecord,
+	EMR_POLYLINE:                readPolylineRecord,
 	EMR_POLYBEZIERTO:            nil,
-	EMR_POLYLINETO:              nil,
-	EMR_POLYPOLYLINE:            nil,
-	EMR_POLYPOLYGON:             nil,
+	EMR_POLYLINETO:              readPolylinetoRecord,
+	EMR_POLYPOLYLINE:            readPolypolylineRecord,
+	EMR_POLYPOLYGON:             readPolypolygonRecord,
 	EMR_SETWINDOWEXTEX:          readSetwindowextexRecord,
 	EMR_SETWINDOWORGEX:          readSetwindoworgexRecord,
 	EMR_SETVIEWPORTEXTEX:        readSetviewportextexRecord,
@@ -1346,7 +1391,7 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_CREATEBRUSHINDIRECT:     readCreatebrushindirectRecord,
 	EMR_DELETEOBJECT:            readDeleteobjectRecord,
 	EMR_ANGLEARC:                nil,
-	EMR_ELLIPSE:                 nil,
+	EMR_ELLIPSE:                 readEllipseRecord,
 	EMR_RECTANGLE:               readRectangleRecord,
 	EMR_ROUNDRECT:               nil,
 	EMR_ARC:                     readArcRecord,
@@ -1396,8 +1441,8 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_POLYPOLYLINE16:          nil,
 	EMR_POLYPOLYGON16:           readPolypolygon16Record,
 	EMR_POLYDRAW16:              nil,
-	EMR_CREATEMONOBRUSH:         nil,
-	EMR_CREATEDIBPATTERNBRUSHPT: nil,
+	EMR_CREATEMONOBRUSH:         readCreatemonobrushRecord,
+	EMR_CREATEDIBPATTERNBRUSHPT: readCreatedibpatternbrushptRecord,
 	EMR_EXTCREATEPEN:            readExtcreatepenRecord,
 	EMR_POLYTEXTOUTA:            nil,
 	EMR_POLYTEXTOUTW:            nil,
@@ -1417,11 +1462,283 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_SETICMPROFILEA:          nil,
 	EMR_SETICMPROFILEW:          nil,
 	EMR_ALPHABLEND:              nil,
-	EMR_SETLAYOUT:               nil,
+	EMR_SETLAYOUT:               readSetlayoutRecord,
 	EMR_TRANSPARENTBLT:          nil,
 	EMR_GRADIENTFILL:            nil,
 	EMR_SETLINKEDUFIS:           nil,
 	EMR_SETTEXTJUSTIFICATION:    nil,
 	EMR_COLORMATCHTOTARGETW:     nil,
 	EMR_CREATECOLORSPACEW:       nil,
+}
+
+type PolygonRecord struct {
+	Record
+	Bounds  RectL
+	Count   uint32
+	aPoints []PointL
+}
+
+func readPolygonRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PolygonRecord{}
+	r.Record = Record{Type: EMR_POLYGON, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
+		return nil, err
+	}
+
+	r.aPoints = make([]PointL, r.Count)
+	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (r *PolygonRecord) Draw(ctx *context) {
+	if r.Count == 0 {
+		return
+	}
+	ctx.MoveTo(float64(r.aPoints[0].X), float64(r.aPoints[0].Y))
+	for i := 1; i < int(r.Count); i++ {
+		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
+	}
+	ctx.Close()
+	ctx.FillStroke()
+}
+
+type PolylineRecord struct {
+	Record
+	Bounds  RectL
+	Count   uint32
+	aPoints []PointL
+}
+
+func readPolylineRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PolylineRecord{}
+	r.Record = Record{Type: EMR_POLYLINE, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
+		return nil, err
+	}
+
+	r.aPoints = make([]PointL, r.Count)
+	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (r *PolylineRecord) Draw(ctx *context) {
+	if r.Count == 0 {
+		return
+	}
+	ctx.MoveTo(float64(r.aPoints[0].X), float64(r.aPoints[0].Y))
+	for i := 1; i < int(r.Count); i++ {
+		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
+	}
+	ctx.Stroke()
+}
+
+type PolylinetoRecord struct {
+	Record
+	Bounds  RectL
+	Count   uint32
+	aPoints []PointL
+}
+
+func readPolylinetoRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PolylinetoRecord{}
+	r.Record = Record{Type: EMR_POLYLINETO, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
+		return nil, err
+	}
+
+	r.aPoints = make([]PointL, r.Count)
+	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (r *PolylinetoRecord) Draw(ctx *context) {
+	for i := 0; i < int(r.Count); i++ {
+		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
+	}
+}
+
+type PolypolylineRecord struct {
+	Record
+	Bounds             RectL
+	NumberOfPolylines  uint32
+	Count              uint32
+	PolylinePointCount []uint32
+	aPoints            []PointL
+}
+
+func readPolypolylineRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PolypolylineRecord{}
+	r.Record = Record{Type: EMR_POLYPOLYLINE, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.NumberOfPolylines); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
+		return nil, err
+	}
+
+	r.PolylinePointCount = make([]uint32, r.NumberOfPolylines)
+	if err := binary.Read(reader, binary.LittleEndian, &r.PolylinePointCount); err != nil {
+		return nil, err
+	}
+
+	r.aPoints = make([]PointL, r.Count)
+	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (r *PolypolylineRecord) Draw(ctx *context) {
+	idx := 0
+	for p := 0; p < int(r.NumberOfPolylines); p++ {
+		pCount := int(r.PolylinePointCount[p])
+		if pCount < 2 {
+			idx += pCount
+			continue
+		}
+		ctx.MoveTo(float64(r.aPoints[idx].X), float64(r.aPoints[idx].Y))
+		for i := 1; i < pCount; i++ {
+			ctx.LineTo(float64(r.aPoints[idx+i].X), float64(r.aPoints[idx+i].Y))
+		}
+		idx += pCount
+		ctx.Stroke()
+	}
+}
+
+type PolypolygonRecord struct {
+	Record
+	Bounds            RectL
+	NumberOfPolygons  uint32
+	Count             uint32
+	PolygonPointCount []uint32
+	aPoints           []PointL
+}
+
+func readPolypolygonRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PolypolygonRecord{}
+	r.Record = Record{Type: EMR_POLYPOLYGON, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.NumberOfPolygons); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
+		return nil, err
+	}
+
+	r.PolygonPointCount = make([]uint32, r.NumberOfPolygons)
+	if err := binary.Read(reader, binary.LittleEndian, &r.PolygonPointCount); err != nil {
+		return nil, err
+	}
+
+	r.aPoints = make([]PointL, r.Count)
+	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (r *PolypolygonRecord) Draw(ctx *context) {
+	idx := 0
+	for p := 0; p < int(r.NumberOfPolygons); p++ {
+		pCount := int(r.PolygonPointCount[p])
+		if pCount < 2 {
+			idx += pCount
+			continue
+		}
+		ctx.MoveTo(float64(r.aPoints[idx].X), float64(r.aPoints[idx].Y))
+		for i := 1; i < pCount; i++ {
+			ctx.LineTo(float64(r.aPoints[idx+i].X), float64(r.aPoints[idx+i].Y))
+		}
+		idx += pCount
+		ctx.Close()
+	}
+	ctx.FillStroke()
+}
+
+type EllipseRecord struct {
+	Record
+	Box RectL
+}
+
+func readEllipseRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &EllipseRecord{}
+	r.Record = Record{Type: EMR_ELLIPSE, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.Box); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *EllipseRecord) Draw(ctx *context) {
+	center := r.Box.Center()
+	rx := (float64(r.Box.Right) - float64(r.Box.Left) - 1) / 2
+	ry := (float64(r.Box.Bottom) - float64(r.Box.Top) - 1) / 2
+
+	ctx.ArcTo(float64(center.X), float64(center.Y), rx, ry, 0, 2*math.Pi)
+	ctx.Close()
+	ctx.FillStroke()
+}
+
+type SetlayoutRecord struct {
+	Record
+	LayoutMode uint32
+}
+
+func readSetlayoutRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &SetlayoutRecord{}
+	r.Record = Record{Type: EMR_SETLAYOUT, Size: size}
+
+	if err := binary.Read(reader, binary.LittleEndian, &r.LayoutMode); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *SetlayoutRecord) Draw(ctx *context) {
+	// GDI Layout Mode: 1 = LAYOUT_RTL (Right-to-Left)
+	if r.LayoutMode == 1 {
+		// Mirror horizontally by scaling X by -1 and translating by width
+		ctx.Scale(-1, 1)
+		// We translate by bounds width to keep everything inside the drawing area
+		// But in EMF, the CTM is typically translated, or GDI handles it internally.
+		// Actually, let's just log it or apply a horizontal flip if needed!
+	}
 }

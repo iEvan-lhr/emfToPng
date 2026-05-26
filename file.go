@@ -3,6 +3,7 @@ package emf
 import (
 	"bytes"
 	"image"
+	"image/color"
 	"image/draw"
 	"os"
 
@@ -59,6 +60,12 @@ type context struct {
 	wo, vo *PointL
 	we, ve *SizeL
 	mm     uint32
+
+	textColor color.Color
+	bkColor   color.Color
+
+	worldTransform [6]float64
+	gdiTransform   [6]float64
 }
 
 func (f *EmfFile) initContext(w, h int) *context {
@@ -73,7 +80,25 @@ func (f *EmfFile) initContext(w, h int) *context {
 		h:              h,
 		mm:             MM_TEXT,
 		objects:        make(map[uint32]interface{}),
+		textColor:      color.Black,
+		bkColor:        color.White,
+		worldTransform: [6]float64{1, 0, 0, 1, 0, 0},
+		gdiTransform:   [6]float64{1, 0, 0, 1, 0, 0},
 	}
+}
+
+func (ctx *context) updateCTM() {
+	w := ctx.worldTransform
+	g := ctx.gdiTransform
+	res := [6]float64{
+		w[0]*g[0] + w[1]*g[2],
+		w[0]*g[1] + w[1]*g[3],
+		w[2]*g[0] + w[3]*g[2],
+		w[2]*g[1] + w[3]*g[3],
+		w[4]*g[0] + w[5]*g[2] + g[4],
+		w[4]*g[1] + w[5]*g[3] + g[5],
+	}
+	ctx.SetMatrixTransform(res)
 }
 
 func (ctx context) applyTransformation() {
@@ -107,6 +132,8 @@ func (f *EmfFile) Draw() image.Image {
 	if bounds.Left != 0 || bounds.Top != 0 {
 		ctx.Translate(-float64(bounds.Left), -float64(bounds.Top))
 	}
+
+	ctx.gdiTransform = ctx.GetMatrixTransform()
 
 	for _, rec := range f.Records {
 		rec.Draw(ctx)
