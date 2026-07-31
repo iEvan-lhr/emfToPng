@@ -32,22 +32,24 @@ func readRecord(reader *bytes.Reader) (Recorder, error) {
 	if err := binary.Read(reader, binary.LittleEndian, &rec); err != nil {
 		return nil, err
 	}
+	if rec.Size < 8 || int64(rec.Size) > int64(reader.Len()+8) {
+		return nil, fmt.Errorf("invalid EMF record size %d for type %#x", rec.Size, rec.Type)
+	}
 
 	//fmt.Printf("Parsed record: Offset=%d, Type=%d (0x%x), Size=%d\n", startOffset, rec.Type, rec.Type, rec.Size)
 
 	fn, ok := records[rec.Type]
-	if !ok {
-		return nil, fmt.Errorf("unknown record %#v", rec.Type)
-	}
 
 	var parsed Recorder
-	if fn != nil {
+	if ok && fn != nil {
 		parsed, err = fn(reader, rec.Size)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		parsed = &rec
+		// EMF permits optional and vendor records. Keep their position in the
+		// stream so a single unsupported record does not discard the file.
+		parsed = &RawRecord{Record: rec}
 	}
 
 	// Ensure the reader is positioned exactly at the end of this record.
@@ -336,6 +338,10 @@ func readSettextalignRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 	return r, nil
 }
 
+func (r *SettextalignRecord) Draw(ctx *context) {
+	ctx.textAlign = r.TextAlignmentMode
+}
+
 type SetstretchbltmodeRecord struct {
 	Record
 	StretchMode uint32
@@ -437,6 +443,7 @@ func readSavedcRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *SavedcRecord) Draw(ctx *context) {
+	ctx.saveState()
 	ctx.Save()
 }
 
@@ -457,6 +464,7 @@ func readRestoredcRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *RestoredcRecord) Draw(ctx *context) {
+	ctx.restoreState()
 	ctx.Restore()
 }
 
@@ -477,14 +485,12 @@ func readSetworldtransformRecord(reader *bytes.Reader, size uint32) (Recorder, e
 }
 
 func (r *SetworldtransformRecord) Draw(ctx *context) {
-	tr := ctx.GetMatrixTransform()
-	tr[0] = float64(r.XForm.M11)
-	tr[1] = float64(r.XForm.M12)
-	tr[2] = float64(r.XForm.M21)
-	tr[3] = float64(r.XForm.M22)
-	tr[4] = float64(r.XForm.Dx)
-	tr[5] = float64(r.XForm.Dy)
-	ctx.SetMatrixTransform(tr)
+	ctx.worldTransform = [6]float64{
+		float64(r.XForm.M11), float64(r.XForm.M12),
+		float64(r.XForm.M21), float64(r.XForm.M22),
+		float64(r.XForm.Dx), float64(r.XForm.Dy),
+	}
+	ctx.updateCTM()
 }
 
 type ModifyworldtransformRecord struct {
@@ -509,8 +515,6 @@ func readModifyworldtransformRecord(reader *bytes.Reader, size uint32) (Recorder
 }
 
 func (r *ModifyworldtransformRecord) Draw(ctx *context) {
-	curr := ctx.GetMatrixTransform()
-
 	xf := [6]float64{
 		float64(r.XForm.M11),
 		float64(r.XForm.M12),
@@ -520,6 +524,7 @@ func (r *ModifyworldtransformRecord) Draw(ctx *context) {
 		float64(r.XForm.Dy),
 	}
 
+	curr := ctx.worldTransform
 	var res [6]float64
 
 	switch r.ModifyWorldTransformMode {
@@ -545,7 +550,8 @@ func (r *ModifyworldtransformRecord) Draw(ctx *context) {
 		return
 	}
 
-	ctx.SetMatrixTransform(res)
+	ctx.worldTransform = res
+	ctx.updateCTM()
 }
 
 type SelectobjectRecord struct {
@@ -603,6 +609,7 @@ func (r *SelectobjectRecord) Draw(ctx *context) {
 		}
 		ctx.SetLineWidth(w)
 		ctx.SetStrokeColor(o.ColorRef.GetColor())
+		applyPenStyle(ctx, o.PenStyle, w)
 	case LogPenEx:
 		w := float64(o.Width)
 		if w <= 0 {
@@ -610,6 +617,7 @@ func (r *SelectobjectRecord) Draw(ctx *context) {
 		}
 		ctx.SetLineWidth(w)
 		ctx.SetStrokeColor(o.ColorRef.GetColor())
+		applyPenStyle(ctx, o.PenStyle, w)
 	case LogBrushEx:
 		ctx.SetFillColor(o.Color.GetColor())
 	case *PatternBrushRecord:
@@ -778,14 +786,9 @@ func readArcRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *ArcRecord) Draw(ctx *context) {
-	center := r.Box.Center()
-	rx := (float64(r.Box.Right) - float64(r.Box.Left) - 1) / 2
-	ry := (float64(r.Box.Bottom) - float64(r.Box.Top) - 1) / 2
-	// angles are specified in radians
-	sa := math.Atan2(float64(r.Start.Y-center.Y), float64(r.Start.X-center.X))
-	ea := math.Atan2(float64(r.End.Y-center.Y), float64(r.End.X-center.X)) - sa
-
-	ctx.ArcTo(float64(center.X), float64(center.Y), rx, ry, sa, ea)
+	center, rx, ry, start, sweep := arcGeometry(ctx, r.Box, r.Start, r.End)
+	ctx.MoveTo(float64(r.Start.X), float64(r.Start.Y))
+	ctx.ArcTo(float64(center.X), float64(center.Y), rx, ry, start, sweep)
 	ctx.Stroke()
 }
 
@@ -806,6 +809,7 @@ func readLinetoRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 
 func (r *LinetoRecord) Draw(ctx *context) {
 	ctx.LineTo(float64(r.Point.X), float64(r.Point.Y))
+	ctx.Stroke()
 }
 
 type BeginpathRecord struct {
@@ -829,7 +833,7 @@ func readEndpathRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *EndpathRecord) Draw(ctx *context) {
-	ctx.Close()
+	// EndPath does not close the current subpath. CloseFigure does that.
 }
 
 type ClosefigureRecord struct {
@@ -971,25 +975,25 @@ type ExttextoutwRecord struct {
 func readExttextoutwRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 	r := &ExttextoutwRecord{}
 	r.Record = Record{Type: EMR_EXTTEXTOUTW, Size: size}
-
-	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+	payload := make([]byte, int(size)-8)
+	if _, err := io.ReadFull(reader, payload); err != nil {
 		return nil, err
 	}
-
-	if err := binary.Read(reader, binary.LittleEndian, &r.iGraphicsMode); err != nil {
+	payloadReader := bytes.NewReader(payload)
+	if err := binary.Read(payloadReader, binary.LittleEndian, &r.Bounds); err != nil {
 		return nil, err
 	}
-
-	if err := binary.Read(reader, binary.LittleEndian, &r.exScale); err != nil {
+	if err := binary.Read(payloadReader, binary.LittleEndian, &r.iGraphicsMode); err != nil {
 		return nil, err
 	}
-
-	if err := binary.Read(reader, binary.LittleEndian, &r.eyScale); err != nil {
+	if err := binary.Read(payloadReader, binary.LittleEndian, &r.exScale); err != nil {
 		return nil, err
 	}
-
+	if err := binary.Read(payloadReader, binary.LittleEndian, &r.eyScale); err != nil {
+		return nil, err
+	}
 	var err error
-	r.wEmrText, err = readEmrText(reader, reader.Len()+36)
+	r.wEmrText, err = parseEMRText(payload[28:], payload, true)
 	if err != nil {
 		return nil, err
 	}
@@ -998,36 +1002,7 @@ func readExttextoutwRecord(reader *bytes.Reader, size uint32) (Recorder, error) 
 }
 
 func (r *ExttextoutwRecord) Draw(ctx *context) {
-	x := float64(r.wEmrText.Reference.X)
-	y := float64(r.wEmrText.Reference.Y)
-
-	// Save CTM
-	tr := ctx.GetMatrixTransform()
-
-	// Map user coordinates (x, y) to device space (nx, ny)
-	nx := x*tr[0] + y*tr[2] + tr[4]
-	ny := x*tr[1] + y*tr[3] + tr[5]
-
-	// Get absolute scaling values
-	sx := math.Sqrt(tr[0]*tr[0] + tr[1]*tr[1])
-	sy := math.Sqrt(tr[2]*tr[2] + tr[3]*tr[3])
-
-	if sx < 0.0001 {
-		sx = 1.0
-	}
-	if sy < 0.0001 {
-		sy = 1.0
-	}
-
-	// Set upright CTM: no rotation, positive scales, translated to (nx, ny)
-	ctx.SetMatrixTransform([6]float64{sx, 0, 0, sy, nx, ny})
-
-	// Draw the string at (0, 0) using stored textColor
-	ctx.SetFillColor(ctx.textColor)
-	ctx.FillStringAt(r.wEmrText.OutputString, 0, 0)
-
-	// Restore CTM
-	ctx.SetMatrixTransform(tr)
+	drawEMRText(ctx, r.wEmrText)
 }
 
 type Polybezier16Record struct {
@@ -1058,14 +1033,18 @@ func readPolybezier16Record(reader *bytes.Reader, size uint32) (Recorder, error)
 }
 
 func (r *Polybezier16Record) Draw(ctx *context) {
+	if r.Count < 4 {
+		return
+	}
 	ctx.MoveTo(float64(r.aPoints[0].X), float64(r.aPoints[0].Y))
-	for i := 1; i < int(r.Count); i = i + 3 {
+	for i := 1; i+2 < int(r.Count); i = i + 3 {
 		ctx.CubicCurveTo(
 			float64(r.aPoints[i].X), float64(r.aPoints[i].Y),
 			float64(r.aPoints[i+1].X), float64(r.aPoints[i+1].Y),
 			float64(r.aPoints[i+2].X), float64(r.aPoints[i+2].Y),
 		)
 	}
+	ctx.Stroke()
 }
 
 type Polygon16Record struct {
@@ -1132,11 +1111,14 @@ func readPolyline16Record(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *Polyline16Record) Draw(ctx *context) {
+	if r.Count == 0 {
+		return
+	}
 	ctx.MoveTo(float64(r.aPoints[0].X), float64(r.aPoints[0].Y))
 	for i := 1; i < int(r.Count); i++ {
 		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
 	}
-	// ctx.Stroke()
+	ctx.Stroke()
 }
 
 type Polybezierto16Record struct {
@@ -1167,13 +1149,14 @@ func readPolybezierto16Record(reader *bytes.Reader, size uint32) (Recorder, erro
 }
 
 func (r *Polybezierto16Record) Draw(ctx *context) {
-	for i := 0; i < int(r.Count); i = i + 3 {
+	for i := 0; i+2 < int(r.Count); i = i + 3 {
 		ctx.CubicCurveTo(
 			float64(r.aPoints[i].X), float64(r.aPoints[i].Y),
 			float64(r.aPoints[i+1].X), float64(r.aPoints[i+1].Y),
 			float64(r.aPoints[i+2].X), float64(r.aPoints[i+2].Y),
 		)
 	}
+	ctx.Stroke()
 }
 
 type Polylineto16Record struct {
@@ -1207,6 +1190,7 @@ func (r *Polylineto16Record) Draw(ctx *context) {
 	for i := 0; i < int(r.Count); i++ {
 		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
 	}
+	ctx.Stroke()
 }
 
 type Polypolygon16Record struct {
@@ -1351,10 +1335,10 @@ func readSeticmmodeRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 // map of readers for records
 var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_HEADER:                  readHeaderRecord,
-	EMR_POLYBEZIER:              nil,
+	EMR_POLYBEZIER:              readPolybezierRecord,
 	EMR_POLYGON:                 readPolygonRecord,
 	EMR_POLYLINE:                readPolylineRecord,
-	EMR_POLYBEZIERTO:            nil,
+	EMR_POLYBEZIERTO:            readPolybeziertoRecord,
 	EMR_POLYLINETO:              readPolylinetoRecord,
 	EMR_POLYPOLYLINE:            readPolypolylineRecord,
 	EMR_POLYPOLYGON:             readPolypolygonRecord,
@@ -1362,26 +1346,26 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_SETWINDOWORGEX:          readSetwindoworgexRecord,
 	EMR_SETVIEWPORTEXTEX:        readSetviewportextexRecord,
 	EMR_SETVIEWPORTORGEX:        readSetviewportorgexRecord,
-	EMR_SETBRUSHORGEX:           nil,
+	EMR_SETBRUSHORGEX:           readSetbrushorgexRecord,
 	EMR_EOF:                     readEOFRecord,
-	EMR_SETPIXELV:               nil,
+	EMR_SETPIXELV:               readSetpixelvRecord,
 	EMR_SETMAPPERFLAGS:          nil,
 	EMR_SETMAPMODE:              readSetmapmodeRecord,
 	EMR_SETBKMODE:               readSetbkmodeRecord,
 	EMR_SETPOLYFILLMODE:         readSetpolyfillmodeRecord,
-	EMR_SETROP2:                 nil,
+	EMR_SETROP2:                 readSetrop2Record,
 	EMR_SETSTRETCHBLTMODE:       readSetstretchbltmodeRecord,
 	EMR_SETTEXTALIGN:            readSettextalignRecord,
 	EMR_SETCOLORADJUSTMENT:      nil,
 	EMR_SETTEXTCOLOR:            readSettextcolorRecord,
 	EMR_SETBKCOLOR:              readSetbkcolorRecord,
-	EMR_OFFSETCLIPRGN:           nil,
+	EMR_OFFSETCLIPRGN:           readOffsetcliprgnRecord,
 	EMR_MOVETOEX:                readMovetoexRecord,
-	EMR_SETMETARGN:              nil,
-	EMR_EXCLUDECLIPRECT:         nil,
+	EMR_SETMETARGN:              readSetmetargnRecord,
+	EMR_EXCLUDECLIPRECT:         readExcludecliprectRecord,
 	EMR_INTERSECTCLIPRECT:       readIntersectcliprectRecord,
-	EMR_SCALEVIEWPORTEXTEX:      nil,
-	EMR_SCALEWINDOWEXTEX:        nil,
+	EMR_SCALEVIEWPORTEXTEX:      readScaleviewportextexRecord,
+	EMR_SCALEWINDOWEXTEX:        readScalewindowextexRecord,
 	EMR_SAVEDC:                  readSavedcRecord,
 	EMR_RESTOREDC:               readRestoredcRecord,
 	EMR_SETWORLDTRANSFORM:       readSetworldtransformRecord,
@@ -1390,24 +1374,24 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_CREATEPEN:               readCreatepenRecord,
 	EMR_CREATEBRUSHINDIRECT:     readCreatebrushindirectRecord,
 	EMR_DELETEOBJECT:            readDeleteobjectRecord,
-	EMR_ANGLEARC:                nil,
+	EMR_ANGLEARC:                readAnglearcRecord,
 	EMR_ELLIPSE:                 readEllipseRecord,
 	EMR_RECTANGLE:               readRectangleRecord,
-	EMR_ROUNDRECT:               nil,
+	EMR_ROUNDRECT:               readRoundrectRecord,
 	EMR_ARC:                     readArcRecord,
-	EMR_CHORD:                   nil,
-	EMR_PIE:                     nil,
+	EMR_CHORD:                   readChordRecord,
+	EMR_PIE:                     readPieRecord,
 	EMR_SELECTPALETTE:           nil,
 	EMR_CREATEPALETTE:           nil,
 	EMR_SETPALETTEENTRIES:       nil,
 	EMR_RESIZEPALETTE:           nil,
 	EMR_REALIZEPALETTE:          nil,
-	EMR_EXTFLOODFILL:            nil,
+	EMR_EXTFLOODFILL:            readExtfloodfillRecord,
 	EMR_LINETO:                  readLinetoRecord,
-	EMR_ARCTO:                   nil,
-	EMR_POLYDRAW:                nil,
-	EMR_SETARCDIRECTION:         nil,
-	EMR_SETMITERLIMIT:           nil,
+	EMR_ARCTO:                   readArctoRecord,
+	EMR_POLYDRAW:                readPolydrawRecord,
+	EMR_SETARCDIRECTION:         readSetarcdirectionRecord,
+	EMR_SETMITERLIMIT:           readSetmiterlimitRecord,
 	EMR_BEGINPATH:               readBeginpathRecord,
 	EMR_ENDPATH:                 readEndpathRecord,
 	EMR_CLOSEFIGURE:             readClosefigureRecord,
@@ -1423,29 +1407,29 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_FRAMERGN:                nil,
 	EMR_INVERTRGN:               nil,
 	EMR_PAINTRGN:                nil,
-	EMR_EXTSELECTCLIPRGN:        nil,
+	EMR_EXTSELECTCLIPRGN:        readExtselectcliprgnRecord,
 	EMR_BITBLT:                  readBitbltRecord,
 	EMR_STRETCHBLT:              readStretchbltRecord,
 	EMR_MASKBLT:                 nil,
 	EMR_PLGBLT:                  nil,
-	EMR_SETDIBITSTODEVICE:       nil,
+	EMR_SETDIBITSTODEVICE:       readSetdibitstodeviceRecord,
 	EMR_STRETCHDIBITS:           readStretchdibitsRecord,
 	EMR_EXTCREATEFONTINDIRECTW:  readExtcreatefontindirectwRecord,
-	EMR_EXTTEXTOUTA:             nil,
+	EMR_EXTTEXTOUTA:             readExttextoutaRecord,
 	EMR_EXTTEXTOUTW:             readExttextoutwRecord,
 	EMR_POLYBEZIER16:            readPolybezier16Record,
 	EMR_POLYGON16:               readPolygon16Record,
 	EMR_POLYLINE16:              readPolyline16Record,
 	EMR_POLYBEZIERTO16:          readPolybezierto16Record,
 	EMR_POLYLINETO16:            readPolylineto16Record,
-	EMR_POLYPOLYLINE16:          nil,
+	EMR_POLYPOLYLINE16:          readPolypolyline16Record,
 	EMR_POLYPOLYGON16:           readPolypolygon16Record,
-	EMR_POLYDRAW16:              nil,
+	EMR_POLYDRAW16:              readPolydraw16Record,
 	EMR_CREATEMONOBRUSH:         readCreatemonobrushRecord,
 	EMR_CREATEDIBPATTERNBRUSHPT: readCreatedibpatternbrushptRecord,
 	EMR_EXTCREATEPEN:            readExtcreatepenRecord,
-	EMR_POLYTEXTOUTA:            nil,
-	EMR_POLYTEXTOUTW:            nil,
+	EMR_POLYTEXTOUTA:            readPolytextoutaRecord,
+	EMR_POLYTEXTOUTW:            readPolytextoutwRecord,
 	EMR_SETICMMODE:              readSeticmmodeRecord,
 	EMR_CREATECOLORSPACE:        nil,
 	EMR_SETCOLORSPACE:           nil,
@@ -1461,12 +1445,12 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_COLORCORRECTPALETTE:     nil,
 	EMR_SETICMPROFILEA:          nil,
 	EMR_SETICMPROFILEW:          nil,
-	EMR_ALPHABLEND:              nil,
+	EMR_ALPHABLEND:              readAlphablendRecord,
 	EMR_SETLAYOUT:               readSetlayoutRecord,
-	EMR_TRANSPARENTBLT:          nil,
-	EMR_GRADIENTFILL:            nil,
+	EMR_TRANSPARENTBLT:          readTransparentbltRecord,
+	EMR_GRADIENTFILL:            readGradientFillRecord,
 	EMR_SETLINKEDUFIS:           nil,
-	EMR_SETTEXTJUSTIFICATION:    nil,
+	EMR_SETTEXTJUSTIFICATION:    readSettextjustificationRecord,
 	EMR_COLORMATCHTOTARGETW:     nil,
 	EMR_CREATECOLORSPACEW:       nil,
 }
@@ -1579,6 +1563,7 @@ func (r *PolylinetoRecord) Draw(ctx *context) {
 	for i := 0; i < int(r.Count); i++ {
 		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
 	}
+	ctx.Stroke()
 }
 
 type PolypolylineRecord struct {
@@ -1735,10 +1720,10 @@ func readSetlayoutRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 func (r *SetlayoutRecord) Draw(ctx *context) {
 	// GDI Layout Mode: 1 = LAYOUT_RTL (Right-to-Left)
 	if r.LayoutMode == 1 {
-		// Mirror horizontally by scaling X by -1 and translating by width
-		ctx.Scale(-1, 1)
-		// We translate by bounds width to keep everything inside the drawing area
-		// But in EMF, the CTM is typically translated, or GDI handles it internally.
-		// Actually, let's just log it or apply a horizontal flip if needed!
+		tr := ctx.GetMatrixTransform()
+		tr[0] = -tr[0]
+		tr[1] = -tr[1]
+		tr[4] = float64(ctx.w) - tr[4]
+		ctx.SetMatrixTransform(tr)
 	}
 }

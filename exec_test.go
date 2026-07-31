@@ -55,3 +55,40 @@ func TestAnalyzeEMF(t *testing.T) {
 		t.Logf("  Type 0x%x (%d): %d", rType, rType, count)
 	}
 }
+
+func TestCheckUnhandledRecords(t *testing.T) {
+	file, err := os.ReadFile("image11.emf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	emfFile, err := ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unhandled := make(map[uint32]int)
+	for _, rec := range emfFile.Records {
+		val := reflect.ValueOf(rec)
+		if val.Kind() == reflect.Ptr {
+			val = val.Elem()
+		}
+		var rType uint32
+		f := val.FieldByName("Record")
+		if f.IsValid() {
+			rType = uint32(f.FieldByName("Type").Uint())
+		} else {
+			fType := val.FieldByName("Type")
+			if fType.IsValid() {
+				rType = uint32(fType.Uint())
+			}
+		}
+
+		fn, exists := records[rType]
+		if !exists || fn == nil {
+			unhandled[rType]++
+		}
+	}
+	t.Logf("Unhandled/nil record types in image11.emf:")
+	for rType, count := range unhandled {
+		t.Logf("  Type 0x%02x (%d): %d", rType, rType, count)
+	}
+}
