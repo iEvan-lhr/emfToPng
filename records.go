@@ -20,6 +20,17 @@ type Record struct {
 	Type, Size uint32
 }
 
+func checkedCount(size, fixed, count, elementSize uint32) (int, error) {
+	if size < 8 || fixed > size-8 || elementSize == 0 {
+		return 0, fmt.Errorf("invalid record payload size %d", size)
+	}
+	maxCount := (size - 8 - fixed) / elementSize
+	if count > maxCount {
+		return 0, fmt.Errorf("record count %d exceeds payload capacity %d", count, maxCount)
+	}
+	return int(count), nil
+}
+
 func (r *Record) Draw(ctx *context) {}
 
 func readRecord(reader *bytes.Reader) (Recorder, error) {
@@ -42,7 +53,14 @@ func readRecord(reader *bytes.Reader) (Recorder, error) {
 
 	var parsed Recorder
 	if ok && fn != nil {
-		parsed, err = fn(reader, rec.Size)
+		// Parse known records from a bounded payload. A malformed offset or
+		// length must not make a record reader consume bytes from the next
+		// record before the final alignment seek below.
+		payload := make([]byte, rec.Size-8)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return nil, err
+		}
+		parsed, err = fn(bytes.NewReader(payload), rec.Size)
 		if err != nil {
 			return nil, err
 		}
@@ -156,7 +174,7 @@ func readSetwindowextexRecord(reader *bytes.Reader, size uint32) (Recorder, erro
 
 func (r *SetwindowextexRecord) Draw(ctx *context) {
 	ctx.we = &r.Extent
-	ctx.applyTransformation()
+	ctx.updateMapping()
 }
 
 type SetwindoworgexRecord struct {
@@ -177,7 +195,7 @@ func readSetwindoworgexRecord(reader *bytes.Reader, size uint32) (Recorder, erro
 
 func (r *SetwindoworgexRecord) Draw(ctx *context) {
 	ctx.wo = &r.Origin
-	ctx.applyTransformation()
+	ctx.updateMapping()
 }
 
 type SetviewportextexRecord struct {
@@ -198,7 +216,7 @@ func readSetviewportextexRecord(reader *bytes.Reader, size uint32) (Recorder, er
 
 func (r *SetviewportextexRecord) Draw(ctx *context) {
 	ctx.ve = &r.Extent
-	ctx.applyTransformation()
+	ctx.updateMapping()
 }
 
 type SetviewportorgexRecord struct {
@@ -219,7 +237,7 @@ func readSetviewportorgexRecord(reader *bytes.Reader, size uint32) (Recorder, er
 
 func (r *SetviewportorgexRecord) Draw(ctx *context) {
 	ctx.vo = &r.Origin
-	ctx.applyTransformation()
+	ctx.updateMapping()
 }
 
 type EOFRecord struct {
@@ -270,16 +288,7 @@ func readSetmapmodeRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 // http://msdn.microsoft.com/en-us/library/dd183475(v=vs.85).aspx
 func (r *SetmapmodeRecord) Draw(ctx *context) {
 	ctx.mm = r.MapMode
-	switch r.MapMode {
-	// rotate y axis
-	case MM_LOMETRIC, MM_HIMETRIC, MM_LOENGLISH, MM_HIENGLISH, MM_TWIPS:
-		ctx.Scale(1, -1)
-		// can't use ctx.Translate here because it will be scaled
-		// if scaling already applied before
-		tr := ctx.GetMatrixTransform()
-		tr[5] = float64(ctx.h)
-		ctx.SetMatrixTransform(tr)
-	}
+	ctx.updateMapping()
 }
 
 type SetbkmodeRecord struct {
@@ -421,6 +430,10 @@ func (r *MovetoexRecord) Draw(ctx *context) {
 type IntersectcliprectRecord struct {
 	Record
 	Clip RectL
+}
+
+func (r *IntersectcliprectRecord) Draw(ctx *context) {
+	ctx.applyClipMask(ctx.clipRect(r.Clip), RGN_AND)
 }
 
 func readIntersectcliprectRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
@@ -921,6 +934,11 @@ func readSelectclippathRecord(reader *bytes.Reader, size uint32) (Recorder, erro
 	return r, nil
 }
 
+func (r *SelectclippathRecord) Draw(ctx *context) {
+	ctx.applyClipMask(ctx.clipPath(), r.RegionMode)
+	ctx.BeginPath()
+}
+
 type CommentRecord struct {
 	Record
 }
@@ -1024,7 +1042,11 @@ func readPolybezier16Record(reader *bytes.Reader, size uint32) (Recorder, error)
 		return nil, err
 	}
 
-	r.aPoints = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1066,7 +1088,11 @@ func readPolygon16Record(reader *bytes.Reader, size uint32) (Recorder, error) {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1102,7 +1128,11 @@ func readPolyline16Record(reader *bytes.Reader, size uint32) (Recorder, error) {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1140,7 +1170,11 @@ func readPolybezierto16Record(reader *bytes.Reader, size uint32) (Recorder, erro
 		return nil, err
 	}
 
-	r.aPoints = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1178,7 +1212,11 @@ func readPolylineto16Record(reader *bytes.Reader, size uint32) (Recorder, error)
 		return nil, err
 	}
 
-	r.aPoints = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1218,12 +1256,20 @@ func readPolypolygon16Record(reader *bytes.Reader, size uint32) (Recorder, error
 		return nil, err
 	}
 
-	r.PolygonPointCount = make([]uint32, r.NumberOfPolygons)
+	polygonCount, err := checkedCount(size, 24, r.NumberOfPolygons, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.PolygonPointCount = make([]uint32, polygonCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.PolygonPointCount); err != nil {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 24+r.NumberOfPolygons*4, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1304,8 +1350,8 @@ func readExtcreatepenRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 		return nil, err
 	}
 
-	r.BitsSrc = make([]byte, r.cbBits)
-	if _, err := reader.Read(r.BitsSrc); err != nil {
+	r.BitsSrc, err = readRecordBytes(reader, uint64(r.cbBits))
+	if err != nil {
 		return nil, err
 	}
 
@@ -1403,14 +1449,14 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_SELECTCLIPPATH:          readSelectclippathRecord,
 	EMR_ABORTPATH:               nil,
 	EMR_COMMENT:                 readCommentRecord,
-	EMR_FILLRGN:                 nil,
-	EMR_FRAMERGN:                nil,
-	EMR_INVERTRGN:               nil,
-	EMR_PAINTRGN:                nil,
+	EMR_FILLRGN:                 readFillrgnRecord,
+	EMR_FRAMERGN:                readFramergnRecord,
+	EMR_INVERTRGN:               readInvertrgnRecord,
+	EMR_PAINTRGN:                readPaintrgnRecord,
 	EMR_EXTSELECTCLIPRGN:        readExtselectcliprgnRecord,
 	EMR_BITBLT:                  readBitbltRecord,
 	EMR_STRETCHBLT:              readStretchbltRecord,
-	EMR_MASKBLT:                 nil,
+	EMR_MASKBLT:                 readMaskbltRecord,
 	EMR_PLGBLT:                  nil,
 	EMR_SETDIBITSTODEVICE:       readSetdibitstodeviceRecord,
 	EMR_STRETCHDIBITS:           readStretchdibitsRecord,
@@ -1474,7 +1520,11 @@ func readPolygonRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1513,7 +1563,11 @@ func readPolylineRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1551,7 +1605,11 @@ func readPolylinetoRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1591,12 +1649,20 @@ func readPolypolylineRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 		return nil, err
 	}
 
-	r.PolylinePointCount = make([]uint32, r.NumberOfPolylines)
+	polylineCount, err := checkedCount(size, 24, r.NumberOfPolylines, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.PolylinePointCount = make([]uint32, polylineCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.PolylinePointCount); err != nil {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 24+r.NumberOfPolylines*4, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}
@@ -1646,12 +1712,20 @@ func readPolypolygonRecord(reader *bytes.Reader, size uint32) (Recorder, error) 
 		return nil, err
 	}
 
-	r.PolygonPointCount = make([]uint32, r.NumberOfPolygons)
+	polygonCount, err := checkedCount(size, 24, r.NumberOfPolygons, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.PolygonPointCount = make([]uint32, polygonCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.PolygonPointCount); err != nil {
 		return nil, err
 	}
 
-	r.aPoints = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 24+r.NumberOfPolygons*4, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.aPoints = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.aPoints); err != nil {
 		return nil, err
 	}

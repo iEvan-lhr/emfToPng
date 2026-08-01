@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"io"
 	"math"
 	"unicode/utf16"
@@ -89,7 +90,11 @@ func readGradientFillRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Mode); err != nil {
 		return nil, err
 	}
-	r.Vertices = make([]TriVertex, vertexCount)
+	vertexCountValue, err := checkedCount(size, 28, vertexCount, 16)
+	if err != nil {
+		return nil, err
+	}
+	r.Vertices = make([]TriVertex, vertexCountValue)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Vertices); err != nil {
 		return nil, err
 	}
@@ -97,7 +102,11 @@ func readGradientFillRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 	if r.Mode == gradientFillRectH || r.Mode == gradientFillRectV {
 		indicesPerMesh = 2
 	}
-	r.Indices = make([]uint32, meshCount*indicesPerMesh)
+	indexCount, err := checkedCount(size, 28+vertexCount*16, meshCount, indicesPerMesh*4)
+	if err != nil {
+		return nil, err
+	}
+	r.Indices = make([]uint32, indexCount*int(indicesPerMesh))
 	if err := binary.Read(reader, binary.LittleEndian, &r.Indices); err != nil {
 		return nil, err
 	}
@@ -209,7 +218,7 @@ func drawGradientTriangle(ctx *context, a, b, c TriVertex) {
 }
 
 func setImagePixel(ctx *context, x, y int, c color.Color) {
-	if imagePointInBounds(ctx, x, y) {
+	if imagePointInBounds(ctx, x, y) && ctx.clipAllows(x, y) {
 		ctx.img.Set(x, y, c)
 	}
 }
@@ -268,7 +277,7 @@ func parseEMRText(header, payload []byte, wide bool) (EmrText, error) {
 			if stringOffset+byteCount > int64(len(payload)) {
 				return result, io.ErrUnexpectedEOF
 			}
-			data := make([]uint16, result.Chars)
+			data := make([]uint16, int(result.Chars))
 			if err := binary.Read(bytes.NewReader(payload[stringOffset:stringOffset+byteCount]), binary.LittleEndian, &data); err != nil {
 				return result, err
 			}
@@ -373,7 +382,11 @@ func readPolytextoutRecord(reader *bytes.Reader, size uint32, typ uint32, wide b
 	if err := binary.Read(payloadReader, binary.LittleEndian, &count); err != nil {
 		return nil, err
 	}
-	r.Texts = make([]EmrText, 0, count)
+	textCount, err := checkedCount(size, 32, count, 40)
+	if err != nil {
+		return nil, err
+	}
+	r.Texts = make([]EmrText, 0, textCount)
 	for i := uint32(0); i < count; i++ {
 		start := 32 + int(i)*40
 		if start+40 > len(payload) {
@@ -532,7 +545,9 @@ func (r *ExtfloodfillRecord) Draw(ctx *context) {
 		} else if current != target {
 			continue
 		}
-		ctx.img.Set(point.X, point.Y, fill)
+		if ctx.clipAllows(point.X, point.Y) {
+			ctx.img.Set(point.X, point.Y, fill)
+		}
 		stack = append(stack,
 			image.Point{X: point.X - 1, Y: point.Y},
 			image.Point{X: point.X + 1, Y: point.Y},
@@ -555,7 +570,9 @@ func readSetpixelvRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 
 func (r *SetpixelvRecord) Draw(ctx *context) {
 	x, y := transformPoint(ctx, float64(r.Point.X), float64(r.Point.Y))
-	ctx.img.Set(x, y, r.Color.GetColor())
+	if ctx.clipAllows(x, y) {
+		ctx.img.Set(x, y, r.Color.GetColor())
+	}
 }
 
 type Setrop2Record struct {
@@ -614,6 +631,25 @@ type OffsetcliprgnRecord struct {
 	Offset PointL
 }
 
+func (r *OffsetcliprgnRecord) Draw(ctx *context) {
+	if ctx.clipMask == nil {
+		return
+	}
+	dx1, dy1 := transformPoint(ctx, float64(r.Offset.X), float64(r.Offset.Y))
+	dx0, dy0 := transformPoint(ctx, 0, 0)
+	dx, dy := dx1-dx0, dy1-dy0
+	shifted := image.NewAlpha(ctx.clipMask.Bounds())
+	for y := shifted.Bounds().Min.Y; y < shifted.Bounds().Max.Y; y++ {
+		for x := shifted.Bounds().Min.X; x < shifted.Bounds().Max.X; x++ {
+			sx, sy := x-dx, y-dy
+			if imagePointInBounds(ctx, sx, sy) {
+				shifted.SetAlpha(x, y, ctx.clipMask.AlphaAt(sx, sy))
+			}
+		}
+	}
+	ctx.clipMask = shifted
+}
+
 type SetmetargnRecord struct {
 	Record
 }
@@ -622,11 +658,185 @@ func readSetmetargnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 	return &SetmetargnRecord{Record: Record{Type: EMR_SETMETARGN, Size: size}}, nil
 }
 
+type FillrgnRecord struct {
+	Record
+	Bounds         RectL
+	Brush          uint32
+	RegionDataSize uint32
+	RegionData     []byte
+}
+
+func readFillrgnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &FillrgnRecord{Record: Record{Type: EMR_FILLRGN, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Brush); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.RegionDataSize); err != nil {
+		return nil, err
+	}
+	var err error
+	r.RegionData, err = readRecordBytes(reader, uint64(r.RegionDataSize))
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *FillrgnRecord) Draw(ctx *context) {
+	paintRegion(ctx, regionMask(ctx, r.RegionData), regionBrushColor(ctx, r.Brush))
+}
+
+type FramergnRecord struct {
+	Record
+	Bounds         RectL
+	Brush          uint32
+	RegionDataSize uint32
+	FrameSize      SizeL
+	RegionData     []byte
+}
+
+func readFramergnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &FramergnRecord{Record: Record{Type: EMR_FRAMERGN, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Brush); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.RegionDataSize); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.FrameSize); err != nil {
+		return nil, err
+	}
+	var err error
+	r.RegionData, err = readRecordBytes(reader, uint64(r.RegionDataSize))
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *FramergnRecord) Draw(ctx *context) {
+	paintRegion(ctx, frameRegionMask(ctx, r.RegionData, r.FrameSize), regionBrushColor(ctx, r.Brush))
+}
+
+type InvertrgnRecord struct {
+	Record
+	Bounds         RectL
+	RegionDataSize uint32
+	RegionData     []byte
+}
+
+func readInvertrgnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &InvertrgnRecord{Record: Record{Type: EMR_INVERTRGN, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.RegionDataSize); err != nil {
+		return nil, err
+	}
+	var err error
+	r.RegionData, err = readRecordBytes(reader, uint64(r.RegionDataSize))
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *InvertrgnRecord) Draw(ctx *context) {
+	invertRegion(ctx, regionMask(ctx, r.RegionData))
+}
+
+type PaintrgnRecord struct {
+	Record
+	Bounds         RectL
+	RegionDataSize uint32
+	RegionData     []byte
+}
+
+func readPaintrgnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PaintrgnRecord{Record: Record{Type: EMR_PAINTRGN, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Bounds); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.RegionDataSize); err != nil {
+		return nil, err
+	}
+	var err error
+	r.RegionData, err = readRecordBytes(reader, uint64(r.RegionDataSize))
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *PaintrgnRecord) Draw(ctx *context) {
+	paintRegion(ctx, regionMask(ctx, r.RegionData), ctx.fillColor)
+}
+
+func regionBrushColor(ctx *context, handle uint32) color.Color {
+	object, ok := StockObjects[handle]
+	if !ok {
+		object, ok = ctx.objects[handle]
+	}
+	if ok {
+		switch brush := object.(type) {
+		case LogBrushEx:
+			return brush.Color.GetColor()
+		case *PatternBrushRecord:
+			if brush.BmiSrc.BitCount == 1 {
+				return ctx.textColor
+			}
+			return brush.getColor(0)
+		case bool:
+			return color.Transparent
+		}
+	}
+	return ctx.fillColor
+}
+
+func paintRegion(ctx *context, mask *image.Alpha, fill color.Color) {
+	if mask == nil || fill == nil {
+		return
+	}
+	ctx.paintWithClip(func() {
+		draw.DrawMask(ctx.img, ctx.img.Bounds(), image.NewUniform(fill), image.Point{}, mask, ctx.img.Bounds().Min, draw.Over)
+	})
+}
+
+func invertRegion(ctx *context, mask *image.Alpha) {
+	if mask == nil {
+		return
+	}
+	ctx.paintWithClip(func() {
+		for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
+			for x := mask.Bounds().Min.X; x < mask.Bounds().Max.X; x++ {
+				if mask.AlphaAt(x, y).A == 0 {
+					continue
+				}
+				current := color.RGBAModel.Convert(ctx.img.At(x, y)).(color.RGBA)
+				ctx.img.Set(x, y, color.RGBA{R: ^current.R, G: ^current.G, B: ^current.B, A: current.A})
+			}
+		}
+	})
+}
+
 type ExtselectcliprgnRecord struct {
 	Record
 	RegionDataSize uint32
 	Mode           uint32
 	RegionData     []byte
+}
+
+func (r *ExtselectcliprgnRecord) Draw(ctx *context) {
+	mask := regionMask(ctx, r.RegionData)
+	if mask != nil {
+		ctx.applyClipMask(mask, r.Mode)
+	}
 }
 
 func readExtselectcliprgnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
@@ -646,6 +856,86 @@ func readExtselectcliprgnRecord(reader *bytes.Reader, size uint32) (Recorder, er
 	return r, nil
 }
 
+func regionMask(ctx *context, data []byte) *image.Alpha {
+	mask := image.NewAlpha(ctx.img.Bounds())
+	for _, rect := range regionRects(data) {
+		part := ctx.clipRect(rect)
+		for p := range mask.Pix {
+			if part.Pix[p] > mask.Pix[p] {
+				mask.Pix[p] = part.Pix[p]
+			}
+		}
+	}
+	if len(regionRects(data)) == 0 {
+		return nil
+	}
+	return mask
+}
+
+func regionRects(data []byte) []RectL {
+	if len(data) < 32 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(data[8:12]))
+	maxCount := (len(data) - 32) / 16
+	if count > maxCount {
+		count = maxCount
+	}
+	if count <= 0 {
+		return nil
+	}
+	rects := make([]RectL, count)
+	for i := range rects {
+		offset := 32 + i*16
+		rects[i] = RectL{
+			Left:   int32(binary.LittleEndian.Uint32(data[offset:])),
+			Top:    int32(binary.LittleEndian.Uint32(data[offset+4:])),
+			Right:  int32(binary.LittleEndian.Uint32(data[offset+8:])),
+			Bottom: int32(binary.LittleEndian.Uint32(data[offset+12:])),
+		}
+	}
+	return rects
+}
+
+func frameRegionMask(ctx *context, data []byte, frame SizeL) *image.Alpha {
+	outer := regionMask(ctx, data)
+	if outer == nil {
+		return nil
+	}
+	width, height := int64(frame.Cx), int64(frame.Cy)
+	if width < 0 {
+		width = -width
+	}
+	if height < 0 {
+		height = -height
+	}
+	if width == 0 && height == 0 {
+		return outer
+	}
+	inner := image.NewAlpha(ctx.img.Bounds())
+	for _, rect := range regionRects(data) {
+		left := int64(rect.Left) + width
+		top := int64(rect.Top) + height
+		right := int64(rect.Right) - width
+		bottom := int64(rect.Bottom) - height
+		if left >= right || top >= bottom {
+			continue
+		}
+		part := ctx.clipRect(RectL{Left: int32(left), Top: int32(top), Right: int32(right), Bottom: int32(bottom)})
+		for p := range inner.Pix {
+			if part.Pix[p] > inner.Pix[p] {
+				inner.Pix[p] = part.Pix[p]
+			}
+		}
+	}
+	for i := range outer.Pix {
+		if inner.Pix[i] != 0 {
+			outer.Pix[i] = 0
+		}
+	}
+	return outer
+}
+
 func readOffsetcliprgnRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 	r := &OffsetcliprgnRecord{Record: Record{Type: EMR_OFFSETCLIPRGN, Size: size}}
 	if err := binary.Read(reader, binary.LittleEndian, &r.Offset); err != nil {
@@ -657,6 +947,10 @@ func readOffsetcliprgnRecord(reader *bytes.Reader, size uint32) (Recorder, error
 type ExcludecliprectRecord struct {
 	Record
 	Rect RectL
+}
+
+func (r *ExcludecliprectRecord) Draw(ctx *context) {
+	ctx.applyClipMask(ctx.clipRect(r.Rect), RGN_DIFF)
 }
 
 func readExcludecliprectRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
@@ -690,8 +984,10 @@ func readScalewindowextexRecord(reader *bytes.Reader, size uint32) (Recorder, er
 }
 
 func (r *ScalewindowextexRecord) Draw(ctx *context) {
-	if r.XNum != 0 && r.YNum != 0 && r.XDen != 0 && r.YDen != 0 {
-		ctx.Scale(float64(r.XDen)/float64(r.XNum), float64(r.YDen)/float64(r.YNum))
+	if ctx.we != nil && r.XNum != 0 && r.YNum != 0 && r.XDen != 0 && r.YDen != 0 {
+		ctx.we.Cx = ctx.we.Cx * r.XNum / r.XDen
+		ctx.we.Cy = ctx.we.Cy * r.YNum / r.YDen
+		ctx.updateMapping()
 	}
 }
 
@@ -718,8 +1014,10 @@ func readScaleviewportextexRecord(reader *bytes.Reader, size uint32) (Recorder, 
 }
 
 func (r *ScaleviewportextexRecord) Draw(ctx *context) {
-	if r.XNum != 0 && r.YNum != 0 && r.XDen != 0 && r.YDen != 0 {
-		ctx.Scale(float64(r.XNum)/float64(r.XDen), float64(r.YNum)/float64(r.YDen))
+	if ctx.ve != nil && r.XNum != 0 && r.YNum != 0 && r.XDen != 0 && r.YDen != 0 {
+		ctx.ve.Cx = ctx.ve.Cx * r.XNum / r.XDen
+		ctx.ve.Cy = ctx.ve.Cy * r.YNum / r.YDen
+		ctx.updateMapping()
 	}
 }
 
@@ -738,7 +1036,11 @@ func readPolybezierRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
 		return nil, err
 	}
-	r.Points = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.Points = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Points); err != nil {
 		return nil, err
 	}
@@ -794,12 +1096,16 @@ func readPolydrawRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
 		return nil, err
 	}
-	r.Points = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 5)
+	if err != nil {
+		return nil, err
+	}
+	r.Points = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Points); err != nil {
 		return nil, err
 	}
-	r.Types = make([]byte, r.Count)
-	if _, err := reader.Read(r.Types); err != nil {
+	r.Types = make([]byte, pointCount)
+	if _, err := io.ReadFull(reader, r.Types); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -825,12 +1131,16 @@ func readPolydraw16Record(reader *bytes.Reader, size uint32) (Recorder, error) {
 	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
 		return nil, err
 	}
-	r.Points = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 5)
+	if err != nil {
+		return nil, err
+	}
+	r.Points = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Points); err != nil {
 		return nil, err
 	}
-	r.Types = make([]byte, r.Count)
-	if _, err := reader.Read(r.Types); err != nil {
+	r.Types = make([]byte, pointCount)
+	if _, err := io.ReadFull(reader, r.Types); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -883,7 +1193,11 @@ func readPolybeziertoRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
 		return nil, err
 	}
-	r.Points = make([]PointL, r.Count)
+	pointCount, err := checkedCount(size, 20, r.Count, 8)
+	if err != nil {
+		return nil, err
+	}
+	r.Points = make([]PointL, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Points); err != nil {
 		return nil, err
 	}
@@ -921,11 +1235,19 @@ func readPolypolyline16Record(reader *bytes.Reader, size uint32) (Recorder, erro
 	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
 		return nil, err
 	}
-	r.PointCounts = make([]uint32, r.NumberOfPolylines)
+	polylineCount, err := checkedCount(size, 24, r.NumberOfPolylines, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.PointCounts = make([]uint32, polylineCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.PointCounts); err != nil {
 		return nil, err
 	}
-	r.Points = make([]PointS, r.Count)
+	pointCount, err := checkedCount(size, 24+r.NumberOfPolylines*4, r.Count, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.Points = make([]PointS, pointCount)
 	if err := binary.Read(reader, binary.LittleEndian, &r.Points); err != nil {
 		return nil, err
 	}

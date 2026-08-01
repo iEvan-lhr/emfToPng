@@ -2,6 +2,7 @@ package emf
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -32,6 +33,9 @@ func (f *EmfFile) UnsupportedRecordTypes() map[uint32]int {
 }
 
 func ReadFile(data []byte) (*EmfFile, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("EMF data is too short")
+	}
 	// Skip any leading garbage or padding before EMR_HEADER (Type 1: 01 00 00 00)
 	if len(data) >= 4 && !(data[0] == 1 && data[1] == 0 && data[2] == 0 && data[3] == 0) {
 		if idx := bytes.Index(data, []byte{1, 0, 0, 0}); idx > 0 {
@@ -59,6 +63,9 @@ func ReadFile(data []byte) (*EmfFile, error) {
 			file.Records = append(file.Records, rec)
 		}
 	}
+	if file.Header == nil {
+		return nil, fmt.Errorf("EMF header not found")
+	}
 
 	return file, nil
 }
@@ -76,6 +83,7 @@ type context struct {
 
 	textColor    color.Color
 	bkColor      color.Color
+	fillColor    color.Color
 	textAlign    uint32
 	breakExtra   int32
 	breakCount   int32
@@ -85,8 +93,10 @@ type context struct {
 	miterLimit   float64
 
 	worldTransform [6]float64
+	baseTransform  [6]float64
 	gdiTransform   [6]float64
 	savedStates    []contextState
+	clipMask       *image.Alpha
 }
 
 type contextState struct {
@@ -94,6 +104,7 @@ type contextState struct {
 	mm             uint32
 	textColor      color.Color
 	bkColor        color.Color
+	fillColor      color.Color
 	textAlign      uint32
 	breakExtra     int32
 	breakCount     int32
@@ -102,9 +113,11 @@ type contextState struct {
 	arcDirection   uint32
 	miterLimit     float64
 	worldTransform [6]float64
+	baseTransform  [6]float64
 	gdiTransform   [6]float64
 	we, ve         *SizeL
 	wo, vo         *PointL
+	clipMask       *image.Alpha
 }
 
 func (f *EmfFile) initContext(w, h int) *context {
@@ -121,11 +134,13 @@ func (f *EmfFile) initContext(w, h int) *context {
 		objects:        make(map[uint32]interface{}),
 		textColor:      color.Black,
 		bkColor:        color.White,
+		fillColor:      color.White,
 		textAlign:      0,
 		rop2:           13, // R2_COPYPEN
 		arcDirection:   1,  // AD_COUNTERCLOCKWISE
 		miterLimit:     10,
 		worldTransform: [6]float64{1, 0, 0, 1, 0, 0},
+		baseTransform:  [6]float64{1, 0, 0, 1, 0, 0},
 		gdiTransform:   [6]float64{1, 0, 0, 1, 0, 0},
 	}
 }
@@ -136,6 +151,7 @@ func (ctx *context) saveState() {
 		mm:             ctx.mm,
 		textColor:      ctx.textColor,
 		bkColor:        ctx.bkColor,
+		fillColor:      ctx.fillColor,
 		textAlign:      ctx.textAlign,
 		breakExtra:     ctx.breakExtra,
 		breakCount:     ctx.breakCount,
@@ -144,6 +160,7 @@ func (ctx *context) saveState() {
 		arcDirection:   ctx.arcDirection,
 		miterLimit:     ctx.miterLimit,
 		worldTransform: ctx.worldTransform,
+		baseTransform:  ctx.baseTransform,
 		gdiTransform:   ctx.gdiTransform,
 	}
 	if ctx.we != nil {
@@ -162,6 +179,7 @@ func (ctx *context) saveState() {
 		v := *ctx.vo
 		state.vo = &v
 	}
+	state.clipMask = cloneAlpha(ctx.clipMask)
 	ctx.savedStates = append(ctx.savedStates, state)
 }
 
@@ -174,6 +192,7 @@ func (ctx *context) restoreState() {
 	ctx.mm = state.mm
 	ctx.textColor = state.textColor
 	ctx.bkColor = state.bkColor
+	ctx.fillColor = state.fillColor
 	ctx.textAlign = state.textAlign
 	ctx.breakExtra = state.breakExtra
 	ctx.breakCount = state.breakCount
@@ -182,12 +201,167 @@ func (ctx *context) restoreState() {
 	ctx.arcDirection = state.arcDirection
 	ctx.miterLimit = state.miterLimit
 	ctx.worldTransform = state.worldTransform
+	ctx.baseTransform = state.baseTransform
 	ctx.gdiTransform = state.gdiTransform
 	ctx.we = state.we
 	ctx.ve = state.ve
 	ctx.wo = state.wo
 	ctx.vo = state.vo
+	ctx.clipMask = cloneAlpha(state.clipMask)
 	ctx.SetMatrixTransform(state.matrix)
+}
+
+func cloneAlpha(src *image.Alpha) *image.Alpha {
+	if src == nil {
+		return nil
+	}
+	dst := image.NewAlpha(src.Bounds())
+	copy(dst.Pix, src.Pix)
+	return dst
+}
+
+func (ctx *context) paintWithClip(paint func()) {
+	if ctx.clipMask == nil {
+		paint()
+		return
+	}
+	bounds := ctx.img.Bounds()
+	before := image.NewRGBA(bounds)
+	draw.Draw(before, bounds, ctx.img, bounds.Min, draw.Src)
+	paint()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			alpha := ctx.clipMask.AlphaAt(x, y).A
+			if alpha == 0 {
+				ctx.img.Set(x, y, before.At(x, y))
+				continue
+			}
+			if alpha == 0xff {
+				continue
+			}
+			old := color.RGBAModel.Convert(before.At(x, y)).(color.RGBA)
+			newColor := color.RGBAModel.Convert(ctx.img.At(x, y)).(color.RGBA)
+			ctx.img.Set(x, y, color.RGBA{
+				R: uint8((uint16(old.R)*(255-uint16(alpha)) + uint16(newColor.R)*uint16(alpha)) / 255),
+				G: uint8((uint16(old.G)*(255-uint16(alpha)) + uint16(newColor.G)*uint16(alpha)) / 255),
+				B: uint8((uint16(old.B)*(255-uint16(alpha)) + uint16(newColor.B)*uint16(alpha)) / 255),
+				A: uint8((uint16(old.A)*(255-uint16(alpha)) + uint16(newColor.A)*uint16(alpha)) / 255),
+			})
+		}
+	}
+}
+
+func (ctx *context) Fill(paths ...*draw2d.Path) {
+	ctx.paintWithClip(func() { ctx.GraphicContext.Fill(paths...) })
+}
+
+func (ctx *context) SetFillColor(c color.Color) {
+	ctx.fillColor = c
+	ctx.GraphicContext.SetFillColor(c)
+}
+
+func (ctx *context) Stroke(paths ...*draw2d.Path) {
+	ctx.paintWithClip(func() { ctx.GraphicContext.Stroke(paths...) })
+}
+
+func (ctx *context) FillStroke(paths ...*draw2d.Path) {
+	ctx.paintWithClip(func() { ctx.GraphicContext.FillStroke(paths...) })
+}
+
+func (ctx *context) FillStringAt(text string, x, y float64) (cursor float64) {
+	ctx.paintWithClip(func() { cursor = ctx.GraphicContext.FillStringAt(text, x, y) })
+	return cursor
+}
+
+func (ctx *context) drawImage(dst image.Rectangle, src image.Image) {
+	if ctx.clipMask == nil {
+		draw.Draw(ctx.img, dst, src, src.Bounds().Min, draw.Over)
+		return
+	}
+	draw.DrawMask(ctx.img, dst, src, src.Bounds().Min, ctx.clipMask, dst.Min, draw.Over)
+}
+
+func (ctx *context) clipAllows(x, y int) bool {
+	return ctx.clipMask == nil || ctx.clipMask.AlphaAt(x, y).A != 0
+}
+
+func (ctx *context) applyClipMask(mask *image.Alpha, mode uint32) {
+	if mask == nil {
+		return
+	}
+	if mode == RGN_COPY || ctx.clipMask == nil && mode == RGN_AND {
+		ctx.clipMask = cloneAlpha(mask)
+		return
+	}
+	if ctx.clipMask == nil {
+		ctx.clipMask = image.NewAlpha(ctx.img.Bounds())
+		for i := range ctx.clipMask.Pix {
+			ctx.clipMask.Pix[i] = 0xff
+		}
+	}
+	for i := range ctx.clipMask.Pix {
+		left := ctx.clipMask.Pix[i]
+		right := mask.Pix[i]
+		switch mode {
+		case RGN_OR:
+			if right > left {
+				ctx.clipMask.Pix[i] = right
+			}
+		case RGN_XOR:
+			if left > right {
+				ctx.clipMask.Pix[i] = left - right
+			} else {
+				ctx.clipMask.Pix[i] = right - left
+			}
+		case RGN_DIFF:
+			if right >= left {
+				ctx.clipMask.Pix[i] = 0
+			} else {
+				ctx.clipMask.Pix[i] = left - right
+			}
+		default:
+			ctx.clipMask.Pix[i] = uint8(uint16(left) * uint16(right) / 255)
+		}
+	}
+}
+
+func (ctx *context) clipRect(rect RectL) *image.Alpha {
+	mask := image.NewAlpha(ctx.img.Bounds())
+	x1, y1 := transformPoint(ctx, float64(rect.Left), float64(rect.Top))
+	x2, y2 := transformPoint(ctx, float64(rect.Right), float64(rect.Bottom))
+	if x1 > x2 {
+		x1, x2 = x2, x1
+	}
+	if y1 > y2 {
+		y1, y2 = y2, y1
+	}
+	for y := y1; y < y2; y++ {
+		for x := x1; x < x2; x++ {
+			if imagePointInBounds(ctx, x, y) {
+				mask.SetAlpha(x, y, color.Alpha{A: 0xff})
+			}
+		}
+	}
+	return mask
+}
+
+func (ctx *context) clipPath() *image.Alpha {
+	path := ctx.GetPath()
+	mask := image.NewAlpha(ctx.img.Bounds())
+	rasterImage := image.NewRGBA(ctx.img.Bounds())
+	gc := draw2dimg.NewGraphicContext(rasterImage)
+	gc.SetMatrixTransform(ctx.GetMatrixTransform())
+	gc.SetFillColor(color.White)
+	gc.Fill(&path)
+	for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
+		for x := mask.Bounds().Min.X; x < mask.Bounds().Max.X; x++ {
+			_, _, _, alpha := rasterImage.At(x, y).RGBA()
+			if alpha != 0 {
+				mask.SetAlpha(x, y, color.Alpha{A: uint8(alpha >> 8)})
+			}
+		}
+	}
+	return mask
 }
 
 func (ctx *context) updateCTM() {
@@ -204,31 +378,53 @@ func (ctx *context) updateCTM() {
 	ctx.SetMatrixTransform(res)
 }
 
-func (ctx context) applyTransformation() {
-	if ctx.we == nil || ctx.ve == nil {
-		return
-	}
-
-	switch ctx.mm {
-	case MM_ISOTROPIC, MM_ANISOTROPIC:
-		sx := float64(ctx.ve.Cx) / float64(ctx.we.Cx)
-		sy := float64(ctx.ve.Cy) / float64(ctx.we.Cy)
-		ctx.Scale(sx, sy)
-	default:
-		sx := float64(ctx.w) / float64(ctx.we.Cx)
-		sy := float64(ctx.h) / float64(ctx.we.Cy)
-		ctx.Scale(sx, sy)
-
+func multiplyTransform(a, b [6]float64) [6]float64 {
+	return [6]float64{
+		a[0]*b[0] + a[1]*b[2],
+		a[0]*b[1] + a[1]*b[3],
+		a[2]*b[0] + a[3]*b[2],
+		a[2]*b[1] + a[3]*b[3],
+		a[4]*b[0] + a[5]*b[2] + b[4],
+		a[4]*b[1] + a[5]*b[3] + b[5],
 	}
 }
 
+func (ctx *context) updateMapping() {
+	mapping := [6]float64{1, 0, 0, 1, 0, 0}
+	if ctx.we != nil && ctx.ve != nil && ctx.we.Cx != 0 && ctx.we.Cy != 0 {
+		sx := float64(ctx.ve.Cx) / float64(ctx.we.Cx)
+		sy := float64(ctx.ve.Cy) / float64(ctx.we.Cy)
+		wo, woY := int32(0), int32(0)
+		vo, voY := int32(0), int32(0)
+		if ctx.wo != nil {
+			wo, woY = ctx.wo.X, ctx.wo.Y
+		}
+		if ctx.vo != nil {
+			vo, voY = ctx.vo.X, ctx.vo.Y
+		}
+		mapping = [6]float64{sx, 0, 0, sy, float64(vo) - float64(wo)*sx, float64(voY) - float64(woY)*sy}
+	}
+	if ctx.mm == MM_LOMETRIC || ctx.mm == MM_HIMETRIC || ctx.mm == MM_LOENGLISH || ctx.mm == MM_HIENGLISH || ctx.mm == MM_TWIPS {
+		mapping[3] = -mapping[3]
+		mapping[5] = float64(ctx.h) - mapping[5]
+	}
+	ctx.gdiTransform = multiplyTransform(ctx.baseTransform, mapping)
+	ctx.updateCTM()
+}
+
 func (f *EmfFile) Draw() image.Image {
+	if f == nil || f.Header == nil {
+		return image.NewRGBA(image.Rect(0, 0, 1, 1))
+	}
 
 	bounds := f.Header.Bounds
 
 	// inclusive-inclusive bounds
 	width := int(bounds.Width()) + 1
 	height := int(bounds.Height()) + 1
+	if width <= 0 || height <= 0 {
+		return image.NewRGBA(image.Rect(0, 0, 1, 1))
+	}
 
 	ctx := f.initContext(width, height)
 
@@ -236,7 +432,8 @@ func (f *EmfFile) Draw() image.Image {
 		ctx.Translate(-float64(bounds.Left), -float64(bounds.Top))
 	}
 
-	ctx.gdiTransform = ctx.GetMatrixTransform()
+	ctx.baseTransform = ctx.GetMatrixTransform()
+	ctx.gdiTransform = ctx.baseTransform
 
 	for _, rec := range f.Records {
 		rec.Draw(ctx)

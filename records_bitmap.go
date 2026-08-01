@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
@@ -14,6 +13,17 @@ import (
 
 	"github.com/disintegration/imaging"
 )
+
+func readRecordBytes(reader *bytes.Reader, size uint64) ([]byte, error) {
+	if size > uint64(reader.Len()) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	data := make([]byte, int(size))
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
 
 type bitmapRecord struct {
 	Record
@@ -32,6 +42,32 @@ type bitmapRecord struct {
 	BmiSrc     BitmapInfoHeader
 	ColorTable []byte
 	BitsSrc    []byte
+}
+
+func readDIBBlock(reader *bytes.Reader, offBmi, offBits, cbBits uint32) (BitmapInfoHeader, []byte, []byte, error) {
+	var header BitmapInfoHeader
+	if offBmi == 0 {
+		return header, nil, nil, nil
+	}
+	if offBmi < 8 || offBits < offBmi+40 {
+		return header, nil, nil, fmt.Errorf("invalid DIB offsets bmi=%d bits=%d", offBmi, offBits)
+	}
+	if _, err := reader.Seek(int64(offBmi)-8, io.SeekStart); err != nil {
+		return header, nil, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &header); err != nil {
+		return header, nil, nil, err
+	}
+	colorTableSize := int64(offBits) - int64(offBmi) - 40
+	colorTable, err := readRecordBytes(reader, uint64(colorTableSize))
+	if err != nil {
+		return header, nil, nil, err
+	}
+	bits, err := readRecordBytes(reader, uint64(cbBits))
+	if err != nil {
+		return header, nil, nil, err
+	}
+	return header, colorTable, bits, nil
 }
 
 // unified reader function for EMR_BITBLT and EMR_STRETCHBLT
@@ -134,14 +170,16 @@ func (r *bitmapRecord) read(reader *bytes.Reader) (Recorder, error) {
 	// Read ColorTable
 	colorTableSize := int64(r.offBitsSrc) - int64(r.offBmiSrc) - 40
 	if colorTableSize > 0 {
-		r.ColorTable = make([]byte, colorTableSize)
-		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+		var err error
+		r.ColorTable, err = readRecordBytes(reader, uint64(colorTableSize))
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	r.BitsSrc = make([]byte, r.cbBitsSrc)
-	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
+	var err error
+	r.BitsSrc, err = readRecordBytes(reader, uint64(r.cbBitsSrc))
+	if err != nil {
 		return nil, err
 	}
 
@@ -169,6 +207,99 @@ func (r *bitmapRecord) getColor(idx int) color.RGBA {
 		val = uint8(idx * 17)
 	}
 	return color.RGBA{val, val, val, 0xff}
+}
+
+func (r *bitmapRecord) decodeRLE(width, height, bitCount int, topDown bool) image.Image {
+	if bitCount != 4 && bitCount != 8 {
+		return nil
+	}
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	x, y := 0, 0
+	setIndex := func(idx int) {
+		if x >= 0 && x < width && y >= 0 && y < height {
+			dstY := height - 1 - y
+			if topDown {
+				dstY = y
+			}
+			img.SetRGBA(x, dstY, r.getColor(idx))
+		}
+		x++
+	}
+
+	data := r.BitsSrc
+	for offset := 0; offset+1 < len(data); {
+		count := int(data[offset])
+		value := data[offset+1]
+		offset += 2
+		if count != 0 {
+			for i := 0; i < count; i++ {
+				idx := int(value)
+				if bitCount == 4 {
+					if i&1 == 0 {
+						idx = int(value >> 4)
+					} else {
+						idx = int(value & 0x0f)
+					}
+				}
+				setIndex(idx)
+			}
+			continue
+		}
+
+		switch value {
+		case 0:
+			x = 0
+			y++
+		case 1:
+			return img
+		case 2:
+			if offset+1 >= len(data) {
+				return nil
+			}
+			x += int(data[offset])
+			y += int(data[offset+1])
+			offset += 2
+		default:
+			absoluteCount := int(value)
+			if bitCount == 8 {
+				if offset+absoluteCount > len(data) {
+					return nil
+				}
+				for i := 0; i < absoluteCount; i++ {
+					setIndex(int(data[offset+i]))
+				}
+				offset += absoluteCount
+				if absoluteCount&1 != 0 {
+					offset++
+				}
+				if offset > len(data) {
+					return nil
+				}
+				continue
+			}
+
+			byteCount := (absoluteCount + 1) / 2
+			if offset+byteCount > len(data) {
+				return nil
+			}
+			for i := 0; i < absoluteCount; i++ {
+				packed := data[offset+i/2]
+				if i&1 == 0 {
+					setIndex(int(packed >> 4))
+				} else {
+					setIndex(int(packed & 0x0f))
+				}
+			}
+			offset += byteCount
+			if byteCount&1 != 0 {
+				offset++
+			}
+			if offset > len(data) {
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 func (r *bitmapRecord) readDIBImage() image.Image {
@@ -202,6 +333,16 @@ func (r *bitmapRecord) readDIBImage() image.Image {
 	if bitCount != 1 && bitCount != 4 && bitCount != 8 && bitCount != 16 && bitCount != 24 && bitCount != 32 {
 		fmt.Fprintln(os.Stderr, "emf: unsupported bitmap bit count", r.BmiSrc.BitCount)
 		return nil
+	}
+	if r.BmiSrc.Compression == BI_RLE4 || r.BmiSrc.Compression == BI_RLE8 {
+		expectedBitCount := 4
+		if r.BmiSrc.Compression == BI_RLE8 {
+			expectedBitCount = 8
+		}
+		if bitCount != expectedBitCount {
+			return nil
+		}
+		return r.decodeRLE(width, height, bitCount, topDown)
 	}
 	if r.BmiSrc.Compression != BI_RGB && r.BmiSrc.Compression != BI_BITFIELDS {
 		fmt.Fprintln(os.Stderr, "emf: unsupported bitmap compression", r.BmiSrc.Compression)
@@ -444,18 +585,25 @@ func (r *bitmapRecord) Draw(ctx *context) {
 		img = applyTransparentColor(img, r.BkColorSrc)
 	}
 
-	destX, destY := r.Bounds.Left, r.Bounds.Top
-	destW, destH := r.Bounds.Width(), r.Bounds.Height()
-	if r.Type == EMR_STRETCHBLT || r.Type == EMR_STRETCHDIBITS || r.Type == EMR_SETDIBITSTODEVICE || r.Type == EMR_TRANSPARENTBLT {
-		destX, destY = r.xDest, r.yDest
-		destW, destH = r.cxDest, r.cyDest
+	destX, destY := r.xDest, r.yDest
+	destW, destH := r.cxDest, r.cyDest
+	if destW == 0 || destH == 0 {
+		destX, destY = r.Bounds.Left, r.Bounds.Top
+		destW, destH = r.Bounds.Width(), r.Bounds.Height()
 	}
 	if destW == 0 || destH == 0 {
 		return
 	}
 
-	if (r.Type == EMR_STRETCHDIBITS || r.Type == EMR_SETDIBITSTODEVICE || r.Type == EMR_TRANSPARENTBLT) && r.cxSrc != 0 && r.cySrc != 0 {
-		srcRect := image.Rect(int(r.xSrc), int(r.ySrc), int(r.xSrc+r.cxSrc), int(r.ySrc+r.cySrc))
+	srcW, srcH := r.cxSrc, r.cySrc
+	if r.Type == EMR_BITBLT || r.Type == EMR_ALPHABLEND {
+		srcW, srcH = r.cxDest, r.cyDest
+	}
+	if srcW == 0 || srcH == 0 {
+		srcW, srcH = int32(img.Bounds().Dx()), int32(img.Bounds().Dy())
+	}
+	if r.Type == EMR_STRETCHDIBITS || r.Type == EMR_SETDIBITSTODEVICE || r.Type == EMR_TRANSPARENTBLT || r.Type == EMR_STRETCHBLT || r.Type == EMR_BITBLT || r.Type == EMR_ALPHABLEND {
+		srcRect := image.Rect(int(r.xSrc), int(r.ySrc), int(r.xSrc+srcW), int(r.ySrc+srcH))
 		srcRect = srcRect.Intersect(img.Bounds())
 		if !srcRect.Empty() {
 			img = imaging.Crop(img, srcRect)
@@ -477,7 +625,55 @@ func (r *bitmapRecord) Draw(ctx *context) {
 		img = imaging.Resize(img, right-left, bottom-top, imaging.CatmullRom)
 	}
 
-	draw.Draw(ctx.img, image.Rect(left, top, right, bottom), img, img.Bounds().Min, draw.Over)
+	destination := image.Rect(left, top, right, bottom)
+	if r.Type == EMR_BITBLT || r.Type == EMR_STRETCHBLT {
+		ctx.paintWithClip(func() { drawRasterOperation(ctx, destination, img, r.BitBltRasterOperation) })
+		return
+	}
+	ctx.drawImage(destination, img)
+}
+
+func drawRasterOperation(ctx *context, dst image.Rectangle, src image.Image, operation uint32) {
+	if (operation>>16)&0xff == 0xcc {
+		ctx.drawImage(dst, src)
+		return
+	}
+	for y := dst.Min.Y; y < dst.Max.Y; y++ {
+		for x := dst.Min.X; x < dst.Max.X; x++ {
+			if !imagePointInBounds(ctx, x, y) || !ctx.clipAllows(x, y) {
+				continue
+			}
+			sx := src.Bounds().Min.X + (x-dst.Min.X)*src.Bounds().Dx()/maxInt(1, dst.Dx())
+			sy := src.Bounds().Min.Y + (y-dst.Min.Y)*src.Bounds().Dy()/maxInt(1, dst.Dy())
+			source := color.RGBAModel.Convert(src.At(sx, sy)).(color.RGBA)
+			destination := color.RGBAModel.Convert(ctx.img.At(x, y)).(color.RGBA)
+			result, ok := applyRasterOperation(source, destination, operation)
+			if ok {
+				ctx.img.Set(x, y, result)
+			}
+		}
+	}
+}
+
+func applyRasterOperation(source, destination color.RGBA, operation uint32) (color.RGBA, bool) {
+	switch (operation >> 16) & 0xff {
+	case 0x00: // BLACKNESS
+		return color.RGBA{A: 0xff}, true
+	case 0xaa: // DST
+		return destination, true
+	case 0x55: // DSTINVERT
+		return color.RGBA{R: ^destination.R, G: ^destination.G, B: ^destination.B, A: 0xff}, true
+	case 0x66: // SRCINVERT
+		return color.RGBA{R: source.R ^ destination.R, G: source.G ^ destination.G, B: source.B ^ destination.B, A: 0xff}, true
+	case 0x88: // SRCAND
+		return color.RGBA{R: source.R & destination.R, G: source.G & destination.G, B: source.B & destination.B, A: 0xff}, true
+	case 0xee: // SRCPAINT
+		return color.RGBA{R: source.R | destination.R, G: source.G | destination.G, B: source.B | destination.B, A: 0xff}, true
+	case 0xff: // WHITENESS
+		return color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}, true
+	default:
+		return source, true
+	}
 }
 
 func applySourceAlpha(src image.Image, alpha uint8) image.Image {
@@ -517,6 +713,121 @@ func readBitbltRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 	r := &BitbltRecord{}
 	r.Record = Record{Type: EMR_BITBLT, Size: size}
 	return r.read(reader)
+}
+
+type MaskbltRecord struct {
+	Record
+	Bounds          RectL
+	XDest, YDest    int32
+	CxDest, CyDest  int32
+	RasterOperation uint32
+	XSrc, YSrc      int32
+	XformSrc        XForm
+	BkColorSrc      ColorRef
+	UsageSrc        uint32
+	OffBmiSrc       uint32
+	CbBmiSrc        uint32
+	OffBitsSrc      uint32
+	CbBitsSrc       uint32
+	XMask, YMask    int32
+	UsageMask       uint32
+	OffBmiMask      uint32
+	CbBmiMask       uint32
+	OffBitsMask     uint32
+	CbBitsMask      uint32
+	Source          bitmapRecord
+	Mask            bitmapRecord
+}
+
+func readMaskbltRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &MaskbltRecord{Record: Record{Type: EMR_MASKBLT, Size: size}}
+	for _, value := range []interface{}{
+		&r.Bounds, &r.XDest, &r.YDest, &r.CxDest, &r.CyDest,
+		&r.RasterOperation, &r.XSrc, &r.YSrc, &r.XformSrc,
+		&r.BkColorSrc, &r.UsageSrc, &r.OffBmiSrc, &r.CbBmiSrc,
+		&r.OffBitsSrc, &r.CbBitsSrc, &r.XMask, &r.YMask,
+		&r.UsageMask, &r.OffBmiMask, &r.CbBmiMask, &r.OffBitsMask,
+		&r.CbBitsMask,
+	} {
+		if err := binary.Read(reader, binary.LittleEndian, value); err != nil {
+			return nil, err
+		}
+	}
+
+	sourceHeader, sourceTable, sourceBits, err := readDIBBlock(reader, r.OffBmiSrc, r.OffBitsSrc, r.CbBitsSrc)
+	if err != nil {
+		return nil, err
+	}
+	maskHeader, maskTable, maskBits, err := readDIBBlock(reader, r.OffBmiMask, r.OffBitsMask, r.CbBitsMask)
+	if err != nil {
+		return nil, err
+	}
+	r.Source = bitmapRecord{Record: r.Record, offBmiSrc: r.OffBmiSrc, BmiSrc: sourceHeader, ColorTable: sourceTable, BitsSrc: sourceBits}
+	r.Mask = bitmapRecord{Record: r.Record, offBmiSrc: r.OffBmiMask, BmiSrc: maskHeader, ColorTable: maskTable, BitsSrc: maskBits}
+	return r, nil
+}
+
+func (r *MaskbltRecord) Draw(ctx *context) {
+	source := r.Source.readImage()
+	mask := r.Mask.readImage()
+	if source == nil || mask == nil || r.CxDest == 0 || r.CyDest == 0 {
+		return
+	}
+	srcRect := image.Rect(int(r.XSrc), int(r.YSrc), int(r.XSrc+r.CxDest), int(r.YSrc+r.CyDest)).Intersect(source.Bounds())
+	maskRect := image.Rect(int(r.XMask), int(r.YMask), int(r.XMask+r.CxDest), int(r.YMask+r.CyDest)).Intersect(mask.Bounds())
+	if srcRect.Empty() || maskRect.Empty() {
+		return
+	}
+	source = imaging.Crop(source, srcRect)
+	mask = imaging.Crop(mask, maskRect)
+
+	left, top := transformPoint(ctx, float64(r.XDest), float64(r.YDest))
+	right, bottom := transformPoint(ctx, float64(r.XDest+r.CxDest), float64(r.YDest+r.CyDest))
+	if right < left {
+		left, right = right, left
+	}
+	if bottom < top {
+		top, bottom = bottom, top
+	}
+	if right <= left || bottom <= top {
+		return
+	}
+	if source.Bounds().Dx() != right-left || source.Bounds().Dy() != bottom-top {
+		source = imaging.Resize(source, right-left, bottom-top, imaging.CatmullRom)
+	}
+	if mask.Bounds().Dx() != right-left || mask.Bounds().Dy() != bottom-top {
+		mask = imaging.Resize(mask, right-left, bottom-top, imaging.NearestNeighbor)
+	}
+	foreground := ((r.RasterOperation >> 16) & 0xff) << 16
+	background := ((r.RasterOperation >> 24) & 0xff) << 16
+	drawMaskRasterOperation(ctx, image.Rect(left, top, right, bottom), source, mask, foreground, background)
+}
+
+func drawMaskRasterOperation(ctx *context, dst image.Rectangle, source, mask image.Image, foreground, background uint32) {
+	ctx.paintWithClip(func() {
+		for y := dst.Min.Y; y < dst.Max.Y; y++ {
+			for x := dst.Min.X; x < dst.Max.X; x++ {
+				if !imagePointInBounds(ctx, x, y) || !ctx.clipAllows(x, y) {
+					continue
+				}
+				sx := source.Bounds().Min.X + (x-dst.Min.X)*source.Bounds().Dx()/maxInt(1, dst.Dx())
+				sy := source.Bounds().Min.Y + (y-dst.Min.Y)*source.Bounds().Dy()/maxInt(1, dst.Dy())
+				mx := mask.Bounds().Min.X + (x-dst.Min.X)*mask.Bounds().Dx()/maxInt(1, dst.Dx())
+				my := mask.Bounds().Min.Y + (y-dst.Min.Y)*mask.Bounds().Dy()/maxInt(1, dst.Dy())
+				selected := color.GrayModel.Convert(mask.At(mx, my)).(color.Gray).Y >= 128
+				operation := background
+				if selected {
+					operation = foreground
+				}
+				result, _ := applyRasterOperation(
+					color.RGBAModel.Convert(source.At(sx, sy)).(color.RGBA),
+					color.RGBAModel.Convert(ctx.img.At(x, y)).(color.RGBA),
+					operation,
+				)
+				ctx.img.Set(x, y, result)
+			}
+		}
+	})
 }
 
 type StretchbltRecord struct {
@@ -610,13 +921,15 @@ func readSetdibitstodeviceRecord(reader *bytes.Reader, size uint32) (Recorder, e
 	}
 	colorTableSize := int64(r.offBitsSrc) - int64(r.offBmiSrc) - 40
 	if colorTableSize > 0 {
-		r.ColorTable = make([]byte, colorTableSize)
-		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+		var err error
+		r.ColorTable, err = readRecordBytes(reader, uint64(colorTableSize))
+		if err != nil {
 			return nil, err
 		}
 	}
-	r.BitsSrc = make([]byte, r.cbBitsSrc)
-	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
+	var err error
+	r.BitsSrc, err = readRecordBytes(reader, uint64(r.cbBitsSrc))
+	if err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -691,13 +1004,15 @@ func readTransparentbltRecord(reader *bytes.Reader, size uint32) (Recorder, erro
 	}
 	colorTableSize := int64(r.offBitsSrc) - int64(r.offBmiSrc) - 40
 	if colorTableSize > 0 {
-		r.ColorTable = make([]byte, colorTableSize)
-		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+		var err error
+		r.ColorTable, err = readRecordBytes(reader, uint64(colorTableSize))
+		if err != nil {
 			return nil, err
 		}
 	}
-	r.BitsSrc = make([]byte, r.cbBitsSrc)
-	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
+	var err error
+	r.BitsSrc, err = readRecordBytes(reader, uint64(r.cbBitsSrc))
+	if err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -787,14 +1102,16 @@ func readStretchdibitsRecord(reader *bytes.Reader, size uint32) (Recorder, error
 	// Read ColorTable
 	colorTableSize := int64(r.offBitsSrc) - int64(r.offBmiSrc) - 40
 	if colorTableSize > 0 {
-		r.ColorTable = make([]byte, colorTableSize)
-		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+		var err error
+		r.ColorTable, err = readRecordBytes(reader, uint64(colorTableSize))
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	r.BitsSrc = make([]byte, r.cbBitsSrc)
-	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
+	var err error
+	r.BitsSrc, err = readRecordBytes(reader, uint64(r.cbBitsSrc))
+	if err != nil {
 		return nil, err
 	}
 
@@ -853,14 +1170,16 @@ func readPatternBrushRecord(reader *bytes.Reader, size uint32, recType uint32) (
 	// Read ColorTable and BitsSrc
 	colorTableSize := int64(r.offBits) - int64(r.offBmi) - 40
 	if colorTableSize > 0 {
-		r.ColorTable = make([]byte, colorTableSize)
-		if _, err := io.ReadFull(reader, r.ColorTable); err != nil {
+		var err error
+		r.ColorTable, err = readRecordBytes(reader, uint64(colorTableSize))
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	r.BitsSrc = make([]byte, r.cbBits)
-	if _, err := io.ReadFull(reader, r.BitsSrc); err != nil {
+	var err error
+	r.BitsSrc, err = readRecordBytes(reader, uint64(r.cbBits))
+	if err != nil {
 		return nil, err
 	}
 
