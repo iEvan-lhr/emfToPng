@@ -21,6 +21,12 @@ func TestExecEMF(t *testing.T) {
 	ExecEMF(file2, "image11.emf")
 }
 
+func TestExecEMFWithErrorReturnsFailures(t *testing.T) {
+	if err := ExecEMFWithError([]byte{1, 2, 3}, ""); err == nil {
+		t.Fatal("invalid EMF should return an error")
+	}
+}
+
 func TestAnalyzeEMF(t *testing.T) {
 	file, err := os.ReadFile("image11.emf")
 	if err != nil {

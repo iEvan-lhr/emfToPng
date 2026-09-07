@@ -6,7 +6,9 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"os"
+	"strings"
 
 	"github.com/golang/freetype/truetype"
 	"github.com/llgcode/draw2d"
@@ -84,6 +86,7 @@ type context struct {
 	textColor    color.Color
 	bkColor      color.Color
 	fillColor    color.Color
+	palette      *PaletteRecord
 	textAlign    uint32
 	breakExtra   int32
 	breakCount   int32
@@ -92,32 +95,47 @@ type context struct {
 	arcDirection uint32
 	miterLimit   float64
 
-	worldTransform [6]float64
-	baseTransform  [6]float64
-	gdiTransform   [6]float64
-	savedStates    []contextState
-	clipMask       *image.Alpha
+	worldTransform   [6]float64
+	baseTransform    [6]float64
+	gdiTransform     [6]float64
+	currentX         float64
+	currentY         float64
+	hasCurrentPoint  bool
+	pathActive       bool
+	pathOpen         bool
+	pathTransform    [6]float64
+	pathTransformSet bool
+	savedStates      []contextState
+	clipMask         *image.Alpha
 }
 
 type contextState struct {
-	matrix         [6]float64
-	mm             uint32
-	textColor      color.Color
-	bkColor        color.Color
-	fillColor      color.Color
-	textAlign      uint32
-	breakExtra     int32
-	breakCount     int32
-	brushOrigin    PointL
-	rop2           uint32
-	arcDirection   uint32
-	miterLimit     float64
-	worldTransform [6]float64
-	baseTransform  [6]float64
-	gdiTransform   [6]float64
-	we, ve         *SizeL
-	wo, vo         *PointL
-	clipMask       *image.Alpha
+	matrix           [6]float64
+	mm               uint32
+	textColor        color.Color
+	bkColor          color.Color
+	fillColor        color.Color
+	palette          *PaletteRecord
+	textAlign        uint32
+	breakExtra       int32
+	breakCount       int32
+	brushOrigin      PointL
+	rop2             uint32
+	arcDirection     uint32
+	miterLimit       float64
+	worldTransform   [6]float64
+	baseTransform    [6]float64
+	gdiTransform     [6]float64
+	currentX         float64
+	currentY         float64
+	hasCurrentPoint  bool
+	pathActive       bool
+	pathOpen         bool
+	pathTransform    [6]float64
+	pathTransformSet bool
+	we, ve           *SizeL
+	wo, vo           *PointL
+	clipMask         *image.Alpha
 }
 
 func (f *EmfFile) initContext(w, h int) *context {
@@ -147,21 +165,29 @@ func (f *EmfFile) initContext(w, h int) *context {
 
 func (ctx *context) saveState() {
 	state := contextState{
-		matrix:         ctx.GetMatrixTransform(),
-		mm:             ctx.mm,
-		textColor:      ctx.textColor,
-		bkColor:        ctx.bkColor,
-		fillColor:      ctx.fillColor,
-		textAlign:      ctx.textAlign,
-		breakExtra:     ctx.breakExtra,
-		breakCount:     ctx.breakCount,
-		brushOrigin:    ctx.brushOrigin,
-		rop2:           ctx.rop2,
-		arcDirection:   ctx.arcDirection,
-		miterLimit:     ctx.miterLimit,
-		worldTransform: ctx.worldTransform,
-		baseTransform:  ctx.baseTransform,
-		gdiTransform:   ctx.gdiTransform,
+		matrix:           ctx.GetMatrixTransform(),
+		mm:               ctx.mm,
+		textColor:        ctx.textColor,
+		bkColor:          ctx.bkColor,
+		fillColor:        ctx.fillColor,
+		palette:          ctx.palette,
+		textAlign:        ctx.textAlign,
+		breakExtra:       ctx.breakExtra,
+		breakCount:       ctx.breakCount,
+		brushOrigin:      ctx.brushOrigin,
+		rop2:             ctx.rop2,
+		arcDirection:     ctx.arcDirection,
+		miterLimit:       ctx.miterLimit,
+		worldTransform:   ctx.worldTransform,
+		baseTransform:    ctx.baseTransform,
+		gdiTransform:     ctx.gdiTransform,
+		currentX:         ctx.currentX,
+		currentY:         ctx.currentY,
+		hasCurrentPoint:  ctx.hasCurrentPoint,
+		pathActive:       ctx.pathActive,
+		pathOpen:         ctx.pathOpen,
+		pathTransform:    ctx.pathTransform,
+		pathTransformSet: ctx.pathTransformSet,
 	}
 	if ctx.we != nil {
 		v := *ctx.we
@@ -187,12 +213,37 @@ func (ctx *context) restoreState() {
 	if len(ctx.savedStates) == 0 {
 		return
 	}
-	state := ctx.savedStates[len(ctx.savedStates)-1]
-	ctx.savedStates = ctx.savedStates[:len(ctx.savedStates)-1]
+	ctx.restoreTo(int32(len(ctx.savedStates)))
+}
+
+func (ctx *context) restoreTo(savedDC int32) {
+	levelCount := len(ctx.savedStates)
+	if levelCount == 0 || savedDC == 0 {
+		return
+	}
+	targetLevel := int(savedDC)
+	if savedDC < 0 {
+		// Preserve the package's established relative-level behavior. When the
+		// stack has only one level, restore that level to reach the baseline.
+		targetLevel = levelCount + int(savedDC)
+		if targetLevel < 1 {
+			targetLevel = 1
+		}
+	}
+	if targetLevel < 1 || targetLevel > levelCount {
+		return
+	}
+	state := ctx.savedStates[targetLevel-1]
+	graphicRestoreCount := levelCount - targetLevel + 1
+	ctx.savedStates = ctx.savedStates[:targetLevel-1]
+	for i := 0; i < graphicRestoreCount; i++ {
+		ctx.Restore()
+	}
 	ctx.mm = state.mm
 	ctx.textColor = state.textColor
 	ctx.bkColor = state.bkColor
 	ctx.fillColor = state.fillColor
+	ctx.palette = state.palette
 	ctx.textAlign = state.textAlign
 	ctx.breakExtra = state.breakExtra
 	ctx.breakCount = state.breakCount
@@ -203,6 +254,13 @@ func (ctx *context) restoreState() {
 	ctx.worldTransform = state.worldTransform
 	ctx.baseTransform = state.baseTransform
 	ctx.gdiTransform = state.gdiTransform
+	ctx.currentX = state.currentX
+	ctx.currentY = state.currentY
+	ctx.hasCurrentPoint = state.hasCurrentPoint
+	ctx.pathActive = state.pathActive
+	ctx.pathOpen = state.pathOpen
+	ctx.pathTransform = state.pathTransform
+	ctx.pathTransformSet = state.pathTransformSet
 	ctx.we = state.we
 	ctx.ve = state.ve
 	ctx.wo = state.wo
@@ -252,7 +310,14 @@ func (ctx *context) paintWithClip(paint func()) {
 }
 
 func (ctx *context) Fill(paths ...*draw2d.Path) {
-	ctx.paintWithClip(func() { ctx.GraphicContext.Fill(paths...) })
+	if ctx.pathOpen {
+		return
+	}
+	ctx.withPathTransform(func() {
+		ctx.paintWithClip(func() { ctx.GraphicContext.Fill(paths...) })
+	})
+	ctx.pathActive = false
+	ctx.pathTransformSet = false
 }
 
 func (ctx *context) SetFillColor(c color.Color) {
@@ -260,12 +325,130 @@ func (ctx *context) SetFillColor(c color.Color) {
 	ctx.GraphicContext.SetFillColor(c)
 }
 
+func (ctx *context) emfMoveTo(x, y float64) {
+	ctx.MoveTo(x, y)
+}
+
+func (ctx *context) emfLineTo(x, y float64) {
+	if !ctx.pathActive {
+		if ctx.hasCurrentPoint {
+			ctx.MoveTo(ctx.currentX, ctx.currentY)
+		} else {
+			ctx.MoveTo(x, y)
+			ctx.currentX, ctx.currentY = x, y
+			ctx.hasCurrentPoint = true
+			ctx.pathActive = true
+			return
+		}
+	}
+	ctx.LineTo(x, y)
+}
+
+func (ctx *context) emfCubicCurveTo(cx1, cy1, cx2, cy2, x, y float64) {
+	if !ctx.pathActive {
+		if ctx.hasCurrentPoint {
+			ctx.MoveTo(ctx.currentX, ctx.currentY)
+		} else {
+			ctx.MoveTo(x, y)
+			ctx.currentX, ctx.currentY = x, y
+			ctx.hasCurrentPoint = true
+			ctx.pathActive = true
+			return
+		}
+	}
+	ctx.CubicCurveTo(cx1, cy1, cx2, cy2, x, y)
+}
+
+func (ctx *context) BeginPath() {
+	ctx.GraphicContext.BeginPath()
+	ctx.pathActive = false
+	ctx.pathOpen = true
+	ctx.pathTransformSet = false
+}
+
+func (ctx *context) EndPath() {
+	ctx.pathOpen = false
+}
+
+func (ctx *context) MoveTo(x, y float64) {
+	ctx.capturePathTransform()
+	ctx.GraphicContext.MoveTo(x, y)
+	ctx.currentX, ctx.currentY = x, y
+	ctx.hasCurrentPoint = true
+	ctx.pathActive = true
+}
+
+func (ctx *context) LineTo(x, y float64) {
+	ctx.capturePathTransform()
+	ctx.GraphicContext.LineTo(x, y)
+	ctx.currentX, ctx.currentY = x, y
+	ctx.hasCurrentPoint = true
+	ctx.pathActive = true
+}
+
+func (ctx *context) CubicCurveTo(cx1, cy1, cx2, cy2, x, y float64) {
+	ctx.capturePathTransform()
+	ctx.GraphicContext.CubicCurveTo(cx1, cy1, cx2, cy2, x, y)
+	ctx.currentX, ctx.currentY = x, y
+	ctx.hasCurrentPoint = true
+	ctx.pathActive = true
+}
+
+func (ctx *context) ArcTo(cx, cy, rx, ry, startAngle, angle float64) {
+	ctx.capturePathTransform()
+	ctx.GraphicContext.ArcTo(cx, cy, rx, ry, startAngle, angle)
+	endAngle := startAngle + angle
+	ctx.currentX = cx + math.Cos(endAngle)*rx
+	ctx.currentY = cy + math.Sin(endAngle)*ry
+	ctx.hasCurrentPoint = true
+	ctx.pathActive = true
+}
+
+func (ctx *context) Close() {
+	if !ctx.pathActive {
+		return
+	}
+	ctx.GraphicContext.Close()
+}
+
 func (ctx *context) Stroke(paths ...*draw2d.Path) {
-	ctx.paintWithClip(func() { ctx.GraphicContext.Stroke(paths...) })
+	if ctx.pathOpen {
+		return
+	}
+	ctx.withPathTransform(func() {
+		ctx.paintWithClip(func() { ctx.GraphicContext.Stroke(paths...) })
+	})
+	ctx.pathActive = false
+	ctx.pathTransformSet = false
 }
 
 func (ctx *context) FillStroke(paths ...*draw2d.Path) {
-	ctx.paintWithClip(func() { ctx.GraphicContext.FillStroke(paths...) })
+	if ctx.pathOpen {
+		return
+	}
+	ctx.withPathTransform(func() {
+		ctx.paintWithClip(func() { ctx.GraphicContext.FillStroke(paths...) })
+	})
+	ctx.pathActive = false
+	ctx.pathTransformSet = false
+}
+
+func (ctx *context) capturePathTransform() {
+	if ctx.pathOpen && !ctx.pathTransformSet {
+		ctx.pathTransform = ctx.GetMatrixTransform()
+		ctx.pathTransformSet = true
+	}
+}
+
+func (ctx *context) withPathTransform(paint func()) {
+	if !ctx.pathTransformSet {
+		paint()
+		return
+	}
+	current := ctx.GetMatrixTransform()
+	ctx.SetMatrixTransform(ctx.pathTransform)
+	paint()
+	ctx.SetMatrixTransform(current)
 }
 
 func (ctx *context) FillStringAt(text string, x, y float64) (cursor float64) {
@@ -329,6 +512,18 @@ func (ctx *context) clipRect(rect RectL) *image.Alpha {
 	mask := image.NewAlpha(ctx.img.Bounds())
 	x1, y1 := transformPoint(ctx, float64(rect.Left), float64(rect.Top))
 	x2, y2 := transformPoint(ctx, float64(rect.Right), float64(rect.Bottom))
+	return fillClipRect(mask, x1, y1, x2, y2)
+}
+
+// IntersectClipRect and ExcludeClipRect are recorded in device coordinates by
+// the EMF producers handled here. Applying the current world transform again
+// collapses these rectangles when the record is inside a transformed DC.
+func (ctx *context) clipRectDevice(rect RectL) *image.Alpha {
+	mask := image.NewAlpha(ctx.img.Bounds())
+	return fillClipRect(mask, int(rect.Left), int(rect.Top), int(rect.Right), int(rect.Bottom))
+}
+
+func fillClipRect(mask *image.Alpha, x1, y1, x2, y2 int) *image.Alpha {
 	if x1 > x2 {
 		x1, x2 = x2, x1
 	}
@@ -337,7 +532,7 @@ func (ctx *context) clipRect(rect RectL) *image.Alpha {
 	}
 	for y := y1; y < y2; y++ {
 		for x := x1; x < x2; x++ {
-			if imagePointInBounds(ctx, x, y) {
+			if (image.Point{X: x, Y: y}).In(mask.Bounds()) {
 				mask.SetAlpha(x, y, color.Alpha{A: 0xff})
 			}
 		}
@@ -350,7 +545,11 @@ func (ctx *context) clipPath() *image.Alpha {
 	mask := image.NewAlpha(ctx.img.Bounds())
 	rasterImage := image.NewRGBA(ctx.img.Bounds())
 	gc := draw2dimg.NewGraphicContext(rasterImage)
-	gc.SetMatrixTransform(ctx.GetMatrixTransform())
+	transform := ctx.GetMatrixTransform()
+	if ctx.pathTransformSet {
+		transform = ctx.pathTransform
+	}
+	gc.SetMatrixTransform(transform)
 	gc.SetFillColor(color.White)
 	gc.Fill(&path)
 	for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
@@ -428,10 +627,6 @@ func (f *EmfFile) Draw() image.Image {
 
 	ctx := f.initContext(width, height)
 
-	if bounds.Left != 0 || bounds.Top != 0 {
-		ctx.Translate(-float64(bounds.Left), -float64(bounds.Top))
-	}
-
 	ctx.baseTransform = ctx.GetMatrixTransform()
 	ctx.gdiTransform = ctx.baseTransform
 
@@ -447,74 +642,127 @@ type FallbackFontCache struct {
 	boldFont    *truetype.Font
 	italicFont  *truetype.Font
 	biFont      *truetype.Font
+	named       map[string]fontFaces
+}
+
+type fontFaces struct {
+	regular *truetype.Font
+	bold    *truetype.Font
+	italic  *truetype.Font
+	bi      *truetype.Font
 }
 
 func (c *FallbackFontCache) Load(fd draw2d.FontData) (*truetype.Font, error) {
 	isBold := fd.Style&draw2d.FontStyleBold != 0
 	isItalic := fd.Style&draw2d.FontStyleItalic != 0
+	faces, ok := c.named[strings.ToLower(strings.TrimSpace(fd.Name))]
+	if ok {
+		if font := selectFontFace(faces, isBold, isItalic); font != nil {
+			return font, nil
+		}
+	}
 
-	if isBold && isItalic && c.biFont != nil {
-		return c.biFont, nil
-	}
-	if isBold && c.boldFont != nil {
-		return c.boldFont, nil
-	}
-	if isItalic && c.italicFont != nil {
-		return c.italicFont, nil
+	font := selectFontFace(fontFaces{
+		regular: c.defaultFont,
+		bold:    c.boldFont,
+		italic:  c.italicFont,
+		bi:      c.biFont,
+	}, isBold, isItalic)
+	if font != nil {
+		return font, nil
 	}
 	return c.defaultFont, nil
 }
 
+func selectFontFace(faces fontFaces, isBold, isItalic bool) *truetype.Font {
+	if isBold && isItalic && faces.bi != nil {
+		return faces.bi
+	}
+	if isBold && faces.bold != nil {
+		return faces.bold
+	}
+	if isItalic && faces.italic != nil {
+		return faces.italic
+	}
+	return faces.regular
+}
+
 func (c *FallbackFontCache) Store(fd draw2d.FontData, font *truetype.Font) {}
 
-func init() {
-	// Try loading the user's NotoSansSC-VF.ttf first from the current directory
-	if b, err := os.ReadFile("NotoSansSC-VF.ttf"); err == nil {
-		if f, err := truetype.Parse(b); err == nil {
-			draw2d.SetFontCache(&FallbackFontCache{
-				defaultFont: f,
-				boldFont:    f,
-				italicFont:  f,
-				biFont:      f,
-			})
-			return
+func loadFont(paths ...string) *truetype.Font {
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		font, err := truetype.Parse(b)
+		if err == nil {
+			return font
 		}
 	}
+	return nil
+}
 
-	paths := []string{
+func init() {
+	defaultFont := loadFont(
+		// Keep the bundled font first so Chinese text remains available when
+		// the converter is run outside Windows.
+		"NotoSansSC-VF.ttf",
+		"C:\\Windows\\Fonts\\NotoSansSC-VF.ttf",
 		"C:\\Windows\\Fonts\\arial.ttf",
 		"/Library/Fonts/Arial.ttf",
 		"/Library/Fonts/Microsoft/Arial.ttf",
 		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 		"/usr/share/fonts/TTF/DejaVuSans.ttf",
 		"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-	}
-
-	var defaultFont *truetype.Font
-	for _, p := range paths {
-		b, err := os.ReadFile(p)
-		if err == nil {
-			f, err := truetype.Parse(b)
-			if err == nil {
-				defaultFont = f
-				break
-			}
-		}
-	}
-
+	)
 	if defaultFont == nil {
 		return
 	}
 
-	var boldFont, italicFont, biFont *truetype.Font
-	if b, err := os.ReadFile("C:\\Windows\\Fonts\\arialbd.ttf"); err == nil {
-		boldFont, _ = truetype.Parse(b)
+	// Do not alias every style to the regular face. EMF records carry the
+	// requested weight, and draw2d uses this cache to select the matching face.
+	boldFont := loadFont(
+		"C:\\Windows\\Fonts\\Noto Sans SC Bold (TrueType).otf",
+		"C:\\Windows\\Fonts\\NotoSansSC-Bold.ttf",
+		"C:\\Windows\\Fonts\\arialbd.ttf",
+	)
+	italicFont := loadFont(
+		"C:\\Windows\\Fonts\\NotoSansSC-Italic.ttf",
+		"C:\\Windows\\Fonts\\ariali.ttf",
+	)
+	biFont := loadFont(
+		"C:\\Windows\\Fonts\\NotoSansSC-BoldItalic.ttf",
+		"C:\\Windows\\Fonts\\arialbi.ttf",
+	)
+	if boldFont == nil {
+		boldFont = defaultFont
 	}
-	if b, err := os.ReadFile("C:\\Windows\\Fonts\\ariali.ttf"); err == nil {
-		italicFont, _ = truetype.Parse(b)
+	if italicFont == nil {
+		italicFont = defaultFont
 	}
-	if b, err := os.ReadFile("C:\\Windows\\Fonts\\arialbi.ttf"); err == nil {
-		biFont, _ = truetype.Parse(b)
+	if biFont == nil {
+		biFont = boldFont
+	}
+
+	named := make(map[string]fontFaces)
+	calibri := fontFaces{
+		regular: loadFont("C:\\Windows\\Fonts\\calibri.ttf"),
+		bold:    loadFont("C:\\Windows\\Fonts\\calibrib.ttf"),
+		italic:  loadFont("C:\\Windows\\Fonts\\calibrii.ttf"),
+		bi:      loadFont("C:\\Windows\\Fonts\\calibriz.ttf"),
+	}
+	if calibri.regular != nil {
+		named["calibri"] = calibri
+	}
+	arial := fontFaces{
+		regular: loadFont("C:\\Windows\\Fonts\\arial.ttf"),
+		bold:    loadFont("C:\\Windows\\Fonts\\arialbd.ttf"),
+		italic:  loadFont("C:\\Windows\\Fonts\\ariali.ttf"),
+		bi:      loadFont("C:\\Windows\\Fonts\\arialbi.ttf"),
+	}
+	if arial.regular != nil {
+		named["arial"] = arial
 	}
 
 	draw2d.SetFontCache(&FallbackFontCache{
@@ -522,5 +770,6 @@ func init() {
 		boldFont:    boldFont,
 		italicFont:  italicFont,
 		biFont:      biFont,
+		named:       named,
 	})
 }

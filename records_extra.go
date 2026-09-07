@@ -950,7 +950,7 @@ type ExcludecliprectRecord struct {
 }
 
 func (r *ExcludecliprectRecord) Draw(ctx *context) {
-	ctx.applyClipMask(ctx.clipRect(r.Rect), RGN_DIFF)
+	ctx.applyClipMask(ctx.clipRectDevice(r.Rect), RGN_DIFF)
 }
 
 func readExcludecliprectRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
@@ -1159,17 +1159,17 @@ func drawPolyDraw(ctx *context, points []PointL, types []byte) {
 		typ := types[i]
 		switch typ & 0x06 {
 		case ptMoveTo:
-			ctx.MoveTo(float64(points[i].X), float64(points[i].Y))
+			ctx.emfMoveTo(float64(points[i].X), float64(points[i].Y))
 			i++
 		case ptLineTo:
-			ctx.LineTo(float64(points[i].X), float64(points[i].Y))
+			ctx.emfLineTo(float64(points[i].X), float64(points[i].Y))
 			i++
 		case ptBezierTo:
 			if i+2 >= len(points) || i+2 >= len(types) {
 				i = len(points)
 				break
 			}
-			ctx.CubicCurveTo(
+			ctx.emfCubicCurveTo(
 				float64(points[i].X), float64(points[i].Y),
 				float64(points[i+1].X), float64(points[i+1].Y),
 				float64(points[i+2].X), float64(points[i+2].Y),
@@ -1206,7 +1206,7 @@ func readPolybeziertoRecord(reader *bytes.Reader, size uint32) (Recorder, error)
 
 func (r *PolybeziertoRecord) Draw(ctx *context) {
 	for i := 0; i+2 < int(r.Count); i += 3 {
-		ctx.CubicCurveTo(
+		ctx.emfCubicCurveTo(
 			float64(r.Points[i].X), float64(r.Points[i].Y),
 			float64(r.Points[i+1].X), float64(r.Points[i+1].Y),
 			float64(r.Points[i+2].X), float64(r.Points[i+2].Y),
@@ -1262,9 +1262,9 @@ func (r *Polypolyline16Record) Draw(ctx *context) {
 			if end > len(r.Points) {
 				end = len(r.Points)
 			}
-			ctx.MoveTo(float64(r.Points[idx].X), float64(r.Points[idx].Y))
+			ctx.emfMoveTo(float64(r.Points[idx].X), float64(r.Points[idx].Y))
 			for i := idx + 1; i < end; i++ {
-				ctx.LineTo(float64(r.Points[i].X), float64(r.Points[i].Y))
+				ctx.emfLineTo(float64(r.Points[i].X), float64(r.Points[i].Y))
 			}
 			ctx.Stroke()
 			idx = end
@@ -1324,8 +1324,11 @@ func readArctoRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 
 func (r *ArctoRecord) Draw(ctx *context) {
 	center, rx, ry, start, sweep := arcGeometry(ctx, r.Box, r.Start, r.End)
-	ctx.LineTo(float64(r.Start.X), float64(r.Start.Y))
+	ctx.emfLineTo(float64(r.Start.X), float64(r.Start.Y))
 	ctx.ArcTo(float64(center.X), float64(center.Y), rx, ry, start, sweep)
+	ctx.currentX, ctx.currentY = float64(r.End.X), float64(r.End.Y)
+	ctx.hasCurrentPoint = true
+	ctx.pathActive = true
 	ctx.Stroke()
 }
 
@@ -1412,8 +1415,12 @@ func (r *AnglearcRecord) Draw(ctx *context) {
 	sweep := float64(r.SweepAngle) * math.Pi / 180
 	x := float64(r.Center.X) + math.Cos(start)*float64(r.Radius)
 	y := float64(r.Center.Y) + math.Sin(start)*float64(r.Radius)
-	ctx.LineTo(x, y)
+	ctx.emfLineTo(x, y)
 	ctx.ArcTo(float64(r.Center.X), float64(r.Center.Y), float64(r.Radius), float64(r.Radius), start, sweep)
+	ctx.currentX = float64(r.Center.X) + math.Cos(start+sweep)*float64(r.Radius)
+	ctx.currentY = float64(r.Center.Y) + math.Sin(start+sweep)*float64(r.Radius)
+	ctx.hasCurrentPoint = true
+	ctx.pathActive = true
 	ctx.Stroke()
 }
 

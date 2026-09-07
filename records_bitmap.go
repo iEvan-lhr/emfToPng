@@ -9,6 +9,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
 	"os"
 
 	"github.com/disintegration/imaging"
@@ -42,6 +43,7 @@ type bitmapRecord struct {
 	BmiSrc     BitmapInfoHeader
 	ColorTable []byte
 	BitsSrc    []byte
+	Palette    []color.RGBA
 }
 
 func readDIBBlock(reader *bytes.Reader, offBmi, offBits, cbBits uint32) (BitmapInfoHeader, []byte, []byte, error) {
@@ -49,7 +51,7 @@ func readDIBBlock(reader *bytes.Reader, offBmi, offBits, cbBits uint32) (BitmapI
 	if offBmi == 0 {
 		return header, nil, nil, nil
 	}
-	if offBmi < 8 || offBits < offBmi+40 {
+	if offBmi < 8 || int64(offBits) < int64(offBmi)+40 {
 		return header, nil, nil, fmt.Errorf("invalid DIB offsets bmi=%d bits=%d", offBmi, offBits)
 	}
 	if _, err := reader.Seek(int64(offBmi)-8, io.SeekStart); err != nil {
@@ -187,6 +189,23 @@ func (r *bitmapRecord) read(reader *bytes.Reader) (Recorder, error) {
 }
 
 func (r *bitmapRecord) getColor(idx int) color.RGBA {
+	if r.UsageSrc == DIB_PAL_COLORS {
+		if idx >= 0 && idx*2+2 <= len(r.ColorTable) {
+			idx = int(binary.LittleEndian.Uint16(r.ColorTable[idx*2:]))
+		}
+		if idx >= 0 && idx < len(r.Palette) {
+			return r.Palette[idx]
+		}
+		value := uint8(idx)
+		return color.RGBA{R: value, G: value, B: value, A: 0xff}
+	}
+	if r.UsageSrc == DIB_PAL_INDICES {
+		if idx >= 0 && idx < len(r.Palette) {
+			return r.Palette[idx]
+		}
+		value := uint8(idx)
+		return color.RGBA{R: value, G: value, B: value, A: 0xff}
+	}
 	offset := idx * 4
 	if offset+3 < len(r.ColorTable) {
 		return color.RGBA{
@@ -574,6 +593,9 @@ func (r *bitmapRecord) readImageLegacy() image.Image {
 }
 
 func (r *bitmapRecord) Draw(ctx *context) {
+	if ctx.palette != nil {
+		r.Palette = ctx.palette.Entries
+	}
 	img := r.readImage()
 	if img == nil {
 		return
@@ -622,11 +644,15 @@ func (r *bitmapRecord) Draw(ctx *context) {
 		return
 	}
 	if img.Bounds().Dx() != right-left || img.Bounds().Dy() != bottom-top {
-		img = imaging.Resize(img, right-left, bottom-top, imaging.CatmullRom)
+		filter := imaging.CatmullRom
+		if r.BmiSrc.BitCount == BI_BITCOUNT_1 || r.BmiSrc.BitCount == BI_BITCOUNT_2 {
+			filter = imaging.NearestNeighbor
+		}
+		img = imaging.Resize(img, right-left, bottom-top, filter)
 	}
 
 	destination := image.Rect(left, top, right, bottom)
-	if r.Type == EMR_BITBLT || r.Type == EMR_STRETCHBLT {
+	if r.BitBltRasterOperation != 0 {
 		ctx.paintWithClip(func() { drawRasterOperation(ctx, destination, img, r.BitBltRasterOperation) })
 		return
 	}
@@ -768,6 +794,10 @@ func readMaskbltRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *MaskbltRecord) Draw(ctx *context) {
+	if ctx.palette != nil {
+		r.Source.Palette = ctx.palette.Entries
+		r.Mask.Palette = ctx.palette.Entries
+	}
 	source := r.Source.readImage()
 	mask := r.Mask.readImage()
 	if source == nil || mask == nil || r.CxDest == 0 || r.CyDest == 0 {
@@ -818,6 +848,138 @@ func drawMaskRasterOperation(ctx *context, dst image.Rectangle, source, mask ima
 				operation := background
 				if selected {
 					operation = foreground
+				}
+				result, _ := applyRasterOperation(
+					color.RGBAModel.Convert(source.At(sx, sy)).(color.RGBA),
+					color.RGBAModel.Convert(ctx.img.At(x, y)).(color.RGBA),
+					operation,
+				)
+				ctx.img.Set(x, y, result)
+			}
+		}
+	})
+}
+
+type PlgbltRecord struct {
+	Record
+	Bounds       RectL
+	AptlDest     [3]PointL
+	XSrc, YSrc   int32
+	CxSrc, CySrc int32
+	XformSrc     XForm
+	BkColorSrc   ColorRef
+	UsageSrc     uint32
+	OffBmiSrc    uint32
+	CbBmiSrc     uint32
+	OffBitsSrc   uint32
+	CbBitsSrc    uint32
+	XMask, YMask int32
+	UsageMask    uint32
+	OffBmiMask   uint32
+	CbBmiMask    uint32
+	OffBitsMask  uint32
+	CbBitsMask   uint32
+	Source       bitmapRecord
+	Mask         bitmapRecord
+}
+
+func readPlgbltRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PlgbltRecord{Record: Record{Type: EMR_PLGBLT, Size: size}}
+	for _, value := range []interface{}{
+		&r.Bounds, &r.AptlDest, &r.XSrc, &r.YSrc, &r.CxSrc, &r.CySrc,
+		&r.XformSrc, &r.BkColorSrc, &r.UsageSrc, &r.OffBmiSrc,
+		&r.CbBmiSrc, &r.OffBitsSrc, &r.CbBitsSrc, &r.XMask, &r.YMask,
+		&r.UsageMask, &r.OffBmiMask, &r.CbBmiMask, &r.OffBitsMask,
+		&r.CbBitsMask,
+	} {
+		if err := binary.Read(reader, binary.LittleEndian, value); err != nil {
+			return nil, err
+		}
+	}
+
+	sourceHeader, sourceTable, sourceBits, err := readDIBBlock(reader, r.OffBmiSrc, r.OffBitsSrc, r.CbBitsSrc)
+	if err != nil {
+		return nil, err
+	}
+	maskHeader, maskTable, maskBits, err := readDIBBlock(reader, r.OffBmiMask, r.OffBitsMask, r.CbBitsMask)
+	if err != nil {
+		return nil, err
+	}
+	r.Source = bitmapRecord{Record: r.Record, offBmiSrc: r.OffBmiSrc, BmiSrc: sourceHeader, ColorTable: sourceTable, BitsSrc: sourceBits}
+	r.Mask = bitmapRecord{Record: r.Record, offBmiSrc: r.OffBmiMask, BmiSrc: maskHeader, ColorTable: maskTable, BitsSrc: maskBits}
+	return r, nil
+}
+
+func (r *PlgbltRecord) Draw(ctx *context) {
+	if ctx.palette != nil {
+		r.Source.Palette = ctx.palette.Entries
+		r.Mask.Palette = ctx.palette.Entries
+	}
+	source := r.Source.readImage()
+	if source == nil || r.CxSrc <= 0 || r.CySrc <= 0 {
+		return
+	}
+	srcRect := image.Rect(int(r.XSrc), int(r.YSrc), int(r.XSrc+r.CxSrc), int(r.YSrc+r.CySrc)).Intersect(source.Bounds())
+	if srcRect.Empty() {
+		return
+	}
+	source = imaging.Crop(source, srcRect)
+
+	var mask image.Image
+	if r.OffBmiMask != 0 {
+		mask = r.Mask.readImage()
+		if mask == nil {
+			return
+		}
+		maskRect := image.Rect(int(r.XMask), int(r.YMask), int(r.XMask+r.CxSrc), int(r.YMask+r.CySrc)).Intersect(mask.Bounds())
+		if maskRect.Empty() {
+			return
+		}
+		mask = imaging.Crop(mask, maskRect)
+	}
+
+	p0x, p0y := transformPoint(ctx, float64(r.AptlDest[0].X), float64(r.AptlDest[0].Y))
+	p1x, p1y := transformPoint(ctx, float64(r.AptlDest[1].X), float64(r.AptlDest[1].Y))
+	p2x, p2y := transformPoint(ctx, float64(r.AptlDest[2].X), float64(r.AptlDest[2].Y))
+	// EMRPLGBLT stores the source rectangle, destination parallelogram and
+	// optional mask, but no ROP field. Its recorded operation is SRCCOPY.
+	drawParallelogramRasterOperation(ctx, p0x, p0y, p1x, p1y, p2x, p2y, source, mask, 0xcc<<16, 0xaa<<16)
+}
+
+func drawParallelogramRasterOperation(ctx *context, p0x, p0y, p1x, p1y, p2x, p2y int, source, mask image.Image, foreground, background uint32) {
+	ux, uy := float64(p1x-p0x), float64(p1y-p0y)
+	vx, vy := float64(p2x-p0x), float64(p2y-p0y)
+	determinant := ux*vy - uy*vx
+	if determinant == 0 {
+		return
+	}
+	p3x, p3y := float64(p1x+p2x-p0x), float64(p1y+p2y-p0y)
+	minX := int(math.Floor(math.Min(math.Min(float64(p0x), float64(p1x)), math.Min(float64(p2x), p3x))))
+	maxX := int(math.Ceil(math.Max(math.Max(float64(p0x), float64(p1x)), math.Max(float64(p2x), p3x))))
+	minY := int(math.Floor(math.Min(math.Min(float64(p0y), float64(p1y)), math.Min(float64(p2y), p3y))))
+	maxY := int(math.Ceil(math.Max(math.Max(float64(p0y), float64(p1y)), math.Max(float64(p2y), p3y))))
+
+	ctx.paintWithClip(func() {
+		for y := minY; y < maxY; y++ {
+			for x := minX; x < maxX; x++ {
+				if !imagePointInBounds(ctx, x, y) || !ctx.clipAllows(x, y) {
+					continue
+				}
+				px, py := float64(x)+0.5-float64(p0x), float64(y)+0.5-float64(p0y)
+				u := (px*vy - py*vx) / determinant
+				v := (ux*py - uy*px) / determinant
+				if u < 0 || u >= 1 || v < 0 || v >= 1 {
+					continue
+				}
+				sx := source.Bounds().Min.X + minInt(source.Bounds().Dx()-1, int(u*float64(source.Bounds().Dx())))
+				sy := source.Bounds().Min.Y + minInt(source.Bounds().Dy()-1, int(v*float64(source.Bounds().Dy())))
+				operation := foreground
+				if mask != nil {
+					mx := mask.Bounds().Min.X + minInt(mask.Bounds().Dx()-1, int(u*float64(mask.Bounds().Dx())))
+					my := mask.Bounds().Min.Y + minInt(mask.Bounds().Dy()-1, int(v*float64(mask.Bounds().Dy())))
+					if color.GrayModel.Convert(mask.At(mx, my)).(color.Gray).Y < 128 {
+						operation = background
+					}
 				}
 				result, _ := applyRasterOperation(
 					color.RGBAModel.Convert(source.At(sx, sy)).(color.RGBA),

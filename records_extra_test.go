@@ -167,6 +167,90 @@ func TestMaskBltUsesForegroundAndBackgroundRops(t *testing.T) {
 	}
 }
 
+func TestPlgbltMapsSourceIntoParallelogram(t *testing.T) {
+	ctx := (&EmfFile{}).initContext(3, 2)
+	record := &PlgbltRecord{
+		AptlDest: [3]PointL{{X: 0, Y: 0}, {X: 2, Y: 0}, {X: 1, Y: 1}},
+		CxSrc:    2,
+		CySrc:    1,
+		Source: bitmapRecord{
+			offBmiSrc: 1,
+			BmiSrc:    BitmapInfoHeader{Width: 2, Height: 1, Planes: 1, BitCount: BI_BITCOUNT_5, Compression: BI_RGB},
+			BitsSrc:   []byte{0, 0, 255, 0, 255, 0, 0, 0},
+		},
+	}
+	record.Draw(ctx)
+	if got := color.RGBAModel.Convert(ctx.img.At(0, 0)).(color.RGBA); got.R != 255 || got.G != 0 || got.B != 0 {
+		t.Fatalf("PLGBLT first pixel = %+v, want red", got)
+	}
+	if got := color.RGBAModel.Convert(ctx.img.At(1, 0)).(color.RGBA); got.R != 0 || got.G != 255 || got.B != 0 {
+		t.Fatalf("PLGBLT second pixel = %+v, want green", got)
+	}
+	if got := ctx.img.At(1, 1); got != (color.RGBA{}) {
+		t.Fatalf("PLGBLT outside parallelogram = %v, want transparent", got)
+	}
+}
+
+func TestPaletteRecordsColorIndexedBitmap(t *testing.T) {
+	ctx := (&EmfFile{}).initContext(2, 1)
+	create := &PaletteRecord{
+		Handle:  9,
+		Entries: []color.RGBA{{R: 255, A: 255}, {G: 255, A: 255}},
+	}
+	create.Draw(ctx)
+	(&SelectpaletteRecord{Handle: 9}).Draw(ctx)
+	(&SetpaletteentriesRecord{Handle: 9, Start: 1, Entries: []color.RGBA{{B: 255, A: 255}}}).Draw(ctx)
+	(&ResizepaletteRecord{Handle: 9, Count: 3}).Draw(ctx)
+
+	record := &BitbltRecord{bitmapRecord: bitmapRecord{
+		Record:                Record{Type: EMR_BITBLT},
+		offBmiSrc:             1,
+		xDest:                 0,
+		yDest:                 0,
+		cxDest:                2,
+		cyDest:                1,
+		BitBltRasterOperation: 0x00cc0020,
+		BmiSrc: BitmapInfoHeader{
+			Width: 2, Height: 1, Planes: 1, BitCount: BI_BITCOUNT_3, Compression: BI_RGB,
+		},
+		UsageSrc: DIB_PAL_INDICES,
+		BitsSrc:  []byte{0, 1, 0, 0, 0, 0, 0, 0},
+	}}
+	record.Draw(ctx)
+	if got := color.RGBAModel.Convert(ctx.img.At(0, 0)).(color.RGBA); got.R != 255 || got.G != 0 || got.B != 0 {
+		t.Fatalf("palette pixel 0 = %+v, want red", got)
+	}
+	if got := color.RGBAModel.Convert(ctx.img.At(1, 0)).(color.RGBA); got.R != 0 || got.G != 0 || got.B != 255 {
+		t.Fatalf("palette pixel 1 = %+v, want blue", got)
+	}
+	if len(ctx.palette.Entries) != 3 || ctx.palette.Entries[2].A != 255 {
+		t.Fatalf("resized palette = %+v", ctx.palette.Entries)
+	}
+}
+
+func TestRestoreDCHonorsAbsoluteAndRelativeLevels(t *testing.T) {
+	ctx := (&EmfFile{}).initContext(1, 1)
+	red := color.RGBA{R: 255, A: 255}
+	green := color.RGBA{G: 255, A: 255}
+	blue := color.RGBA{B: 255, A: 255}
+	ctx.SetFillColor(red)
+	(&SavedcRecord{}).Draw(ctx)
+	ctx.SetFillColor(green)
+	(&SavedcRecord{}).Draw(ctx)
+	ctx.SetFillColor(blue)
+	(&SavedcRecord{}).Draw(ctx)
+	ctx.SetFillColor(color.White)
+
+	(&RestoredcRecord{SavedDC: -1}).Draw(ctx)
+	if ctx.fillColor != green || len(ctx.savedStates) != 1 {
+		t.Fatalf("RestoreDC(-1) fill=%v levels=%d, want green and one level", ctx.fillColor, len(ctx.savedStates))
+	}
+	(&RestoredcRecord{SavedDC: 1}).Draw(ctx)
+	if ctx.fillColor != red || len(ctx.savedStates) != 0 {
+		t.Fatalf("RestoreDC(1) fill=%v levels=%d, want red and zero levels", ctx.fillColor, len(ctx.savedStates))
+	}
+}
+
 func testRegionData(rect RectL) []byte {
 	data := bytes.NewBuffer(nil)
 	if err := binary.Write(data, binary.LittleEndian, uint32(48)); err != nil {

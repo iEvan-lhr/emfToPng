@@ -176,7 +176,11 @@ func readLogFont(reader *bytes.Reader) (LogFont, error) {
 	if err := binary.Read(reader, binary.LittleEndian, &b); err != nil {
 		return r, err
 	}
-	r.Facename = strings.TrimRight(string(utf16.Decode(b)), "\x00")
+	faceName := string(utf16.Decode(b))
+	if nul := strings.IndexByte(faceName, 0); nul >= 0 {
+		faceName = faceName[:nul]
+	}
+	r.Facename = faceName
 
 	return r, nil
 }

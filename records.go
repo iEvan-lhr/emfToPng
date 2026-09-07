@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"image/color"
 	"io"
 	"math"
 	"os"
@@ -424,7 +425,7 @@ func readMovetoexRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *MovetoexRecord) Draw(ctx *context) {
-	ctx.MoveTo(float64(r.Offset.X), float64(r.Offset.Y))
+	ctx.emfMoveTo(float64(r.Offset.X), float64(r.Offset.Y))
 }
 
 type IntersectcliprectRecord struct {
@@ -433,7 +434,13 @@ type IntersectcliprectRecord struct {
 }
 
 func (r *IntersectcliprectRecord) Draw(ctx *context) {
-	ctx.applyClipMask(ctx.clipRect(r.Clip), RGN_AND)
+	// Some EMF producers emit a zero rectangle while switching the mapping
+	// used by a bitmap pair. Treat it as a no-op instead of poisoning the
+	// following bitmap records with an empty clip.
+	if r.Clip.Left == r.Clip.Right || r.Clip.Top == r.Clip.Bottom {
+		return
+	}
+	ctx.applyClipMask(ctx.clipRectDevice(r.Clip), RGN_AND)
 }
 
 func readIntersectcliprectRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
@@ -477,8 +484,7 @@ func readRestoredcRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *RestoredcRecord) Draw(ctx *context) {
-	ctx.restoreState()
-	ctx.Restore()
+	ctx.restoreTo(r.SavedDC)
 }
 
 type SetworldtransformRecord struct {
@@ -679,6 +685,166 @@ func (r *SelectobjectRecord) Draw(ctx *context) {
 	}
 }
 
+type PaletteRecord struct {
+	Record
+	Handle  uint32
+	Version uint16
+	Entries []color.RGBA
+}
+
+func readPaletteColors(reader *bytes.Reader, size, fixed, count uint32) ([]color.RGBA, error) {
+	entryCount, err := checkedCount(size, fixed, count, 4)
+	if err != nil {
+		return nil, err
+	}
+	raw := make([][4]byte, entryCount)
+	if err := binary.Read(reader, binary.LittleEndian, &raw); err != nil {
+		return nil, err
+	}
+	entries := make([]color.RGBA, entryCount)
+	for i, entry := range raw {
+		entries[i] = color.RGBA{R: entry[1], G: entry[2], B: entry[3], A: 0xff}
+	}
+	return entries, nil
+}
+
+func readCreatepaletteRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &PaletteRecord{Record: Record{Type: EMR_CREATEPALETTE, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Handle); err != nil {
+		return nil, err
+	}
+	var count uint16
+	if err := binary.Read(reader, binary.LittleEndian, &r.Version); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &count); err != nil {
+		return nil, err
+	}
+	var err error
+	r.Entries, err = readPaletteColors(reader, size, 8, uint32(count))
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *PaletteRecord) Draw(ctx *context) {
+	ctx.objects[r.Handle] = r
+}
+
+type SelectpaletteRecord struct {
+	Record
+	Handle uint32
+}
+
+func readSelectpaletteRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &SelectpaletteRecord{Record: Record{Type: EMR_SELECTPALETTE, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Handle); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *SelectpaletteRecord) Draw(ctx *context) {
+	if r.Handle == DEFAULT_PALETTE {
+		ctx.palette = nil
+		return
+	}
+	if object, ok := ctx.objects[r.Handle]; ok {
+		if palette, ok := object.(*PaletteRecord); ok {
+			ctx.palette = palette
+		}
+	}
+}
+
+type SetpaletteentriesRecord struct {
+	Record
+	Handle  uint32
+	Start   uint32
+	Entries []color.RGBA
+}
+
+func readSetpaletteentriesRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &SetpaletteentriesRecord{Record: Record{Type: EMR_SETPALETTEENTRIES, Size: size}}
+	var count uint32
+	if err := binary.Read(reader, binary.LittleEndian, &r.Handle); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Start); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &count); err != nil {
+		return nil, err
+	}
+	var err error
+	r.Entries, err = readPaletteColors(reader, size, 12, count)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *SetpaletteentriesRecord) Draw(ctx *context) {
+	object, ok := ctx.objects[r.Handle]
+	if !ok {
+		return
+	}
+	palette, ok := object.(*PaletteRecord)
+	if !ok || r.Start > uint32(len(palette.Entries)) {
+		return
+	}
+	end := int(r.Start) + len(r.Entries)
+	if end > len(palette.Entries) {
+		end = len(palette.Entries)
+	}
+	copy(palette.Entries[r.Start:end], r.Entries[:end-int(r.Start)])
+}
+
+type ResizepaletteRecord struct {
+	Record
+	Handle uint32
+	Count  uint32
+}
+
+func readResizepaletteRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	r := &ResizepaletteRecord{Record: Record{Type: EMR_RESIZEPALETTE, Size: size}}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Handle); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &r.Count); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *ResizepaletteRecord) Draw(ctx *context) {
+	if r.Count > 65535 {
+		return
+	}
+	object, ok := ctx.objects[r.Handle]
+	palette, okPalette := object.(*PaletteRecord)
+	if !ok || !okPalette {
+		return
+	}
+	if r.Count <= uint32(len(palette.Entries)) {
+		palette.Entries = palette.Entries[:r.Count]
+		return
+	}
+	oldLen := len(palette.Entries)
+	palette.Entries = append(palette.Entries, make([]color.RGBA, int(r.Count)-len(palette.Entries))...)
+	for i := oldLen; i < len(palette.Entries); i++ {
+		palette.Entries[i].A = 0xff
+	}
+}
+
+type RealizepaletteRecord struct {
+	Record
+}
+
+func readRealizepaletteRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
+	return &RealizepaletteRecord{Record: Record{Type: EMR_REALIZEPALETTE, Size: size}}, nil
+}
+
 type CreatepenRecord struct {
 	Record
 	ihPen  uint32
@@ -821,7 +987,7 @@ func readLinetoRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 }
 
 func (r *LinetoRecord) Draw(ctx *context) {
-	ctx.LineTo(float64(r.Point.X), float64(r.Point.Y))
+	ctx.emfLineTo(float64(r.Point.X), float64(r.Point.Y))
 	ctx.Stroke()
 }
 
@@ -847,6 +1013,7 @@ func readEndpathRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 
 func (r *EndpathRecord) Draw(ctx *context) {
 	// EndPath does not close the current subpath. CloseFigure does that.
+	ctx.EndPath()
 }
 
 type ClosefigureRecord struct {
@@ -896,8 +1063,7 @@ func readStrokeandfillpathRecord(reader *bytes.Reader, size uint32) (Recorder, e
 }
 
 func (r *StrokeandfillpathRecord) Draw(ctx *context) {
-	ctx.Fill()
-	ctx.Stroke()
+	ctx.FillStroke()
 }
 
 type StrokepathRecord struct {
@@ -936,7 +1102,10 @@ func readSelectclippathRecord(reader *bytes.Reader, size uint32) (Recorder, erro
 
 func (r *SelectclippathRecord) Draw(ctx *context) {
 	ctx.applyClipMask(ctx.clipPath(), r.RegionMode)
-	ctx.BeginPath()
+	ctx.GraphicContext.BeginPath()
+	ctx.pathActive = false
+	ctx.pathOpen = false
+	ctx.pathTransformSet = false
 }
 
 type CommentRecord struct {
@@ -1058,9 +1227,9 @@ func (r *Polybezier16Record) Draw(ctx *context) {
 	if r.Count < 4 {
 		return
 	}
-	ctx.MoveTo(float64(r.aPoints[0].X), float64(r.aPoints[0].Y))
+	ctx.emfMoveTo(float64(r.aPoints[0].X), float64(r.aPoints[0].Y))
 	for i := 1; i+2 < int(r.Count); i = i + 3 {
-		ctx.CubicCurveTo(
+		ctx.emfCubicCurveTo(
 			float64(r.aPoints[i].X), float64(r.aPoints[i].Y),
 			float64(r.aPoints[i+1].X), float64(r.aPoints[i+1].Y),
 			float64(r.aPoints[i+2].X), float64(r.aPoints[i+2].Y),
@@ -1184,7 +1353,7 @@ func readPolybezierto16Record(reader *bytes.Reader, size uint32) (Recorder, erro
 
 func (r *Polybezierto16Record) Draw(ctx *context) {
 	for i := 0; i+2 < int(r.Count); i = i + 3 {
-		ctx.CubicCurveTo(
+		ctx.emfCubicCurveTo(
 			float64(r.aPoints[i].X), float64(r.aPoints[i].Y),
 			float64(r.aPoints[i+1].X), float64(r.aPoints[i+1].Y),
 			float64(r.aPoints[i+2].X), float64(r.aPoints[i+2].Y),
@@ -1226,7 +1395,7 @@ func readPolylineto16Record(reader *bytes.Reader, size uint32) (Recorder, error)
 
 func (r *Polylineto16Record) Draw(ctx *context) {
 	for i := 0; i < int(r.Count); i++ {
-		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
+		ctx.emfLineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
 	}
 	ctx.Stroke()
 }
@@ -1427,11 +1596,11 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_ARC:                     readArcRecord,
 	EMR_CHORD:                   readChordRecord,
 	EMR_PIE:                     readPieRecord,
-	EMR_SELECTPALETTE:           nil,
-	EMR_CREATEPALETTE:           nil,
-	EMR_SETPALETTEENTRIES:       nil,
-	EMR_RESIZEPALETTE:           nil,
-	EMR_REALIZEPALETTE:          nil,
+	EMR_SELECTPALETTE:           readSelectpaletteRecord,
+	EMR_CREATEPALETTE:           readCreatepaletteRecord,
+	EMR_SETPALETTEENTRIES:       readSetpaletteentriesRecord,
+	EMR_RESIZEPALETTE:           readResizepaletteRecord,
+	EMR_REALIZEPALETTE:          readRealizepaletteRecord,
 	EMR_EXTFLOODFILL:            readExtfloodfillRecord,
 	EMR_LINETO:                  readLinetoRecord,
 	EMR_ARCTO:                   readArctoRecord,
@@ -1457,7 +1626,7 @@ var records = map[uint32]func(*bytes.Reader, uint32) (Recorder, error){
 	EMR_BITBLT:                  readBitbltRecord,
 	EMR_STRETCHBLT:              readStretchbltRecord,
 	EMR_MASKBLT:                 readMaskbltRecord,
-	EMR_PLGBLT:                  nil,
+	EMR_PLGBLT:                  readPlgbltRecord,
 	EMR_SETDIBITSTODEVICE:       readSetdibitstodeviceRecord,
 	EMR_STRETCHDIBITS:           readStretchdibitsRecord,
 	EMR_EXTCREATEFONTINDIRECTW:  readExtcreatefontindirectwRecord,
@@ -1619,7 +1788,7 @@ func readPolylinetoRecord(reader *bytes.Reader, size uint32) (Recorder, error) {
 
 func (r *PolylinetoRecord) Draw(ctx *context) {
 	for i := 0; i < int(r.Count); i++ {
-		ctx.LineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
+		ctx.emfLineTo(float64(r.aPoints[i].X), float64(r.aPoints[i].Y))
 	}
 	ctx.Stroke()
 }

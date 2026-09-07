@@ -11,9 +11,18 @@ import (
 )
 
 func ExecEMF(fdata []byte, fname string) {
+	if err := ExecEMFWithError(fdata, fname); err != nil {
+		log.Printf("emf: %v", err)
+	}
+}
+
+// ExecEMFWithError converts an EMF byte slice to PNG. When fname is empty,
+// the PNG is written to stdout; otherwise the .png output is created next to
+// the supplied EMF filename.
+func ExecEMFWithError(fdata []byte, fname string) error {
 	file, err := ReadFile(fdata)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	img := file.Draw()
@@ -23,9 +32,11 @@ func ExecEMF(fdata []byte, fname string) {
 	if fname != "" {
 		f, err = os.Create(strings.TrimSuffix(fname, ".emf") + ".png")
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		defer f.(*os.File).Close()
+		defer func() {
+			_ = f.(*os.File).Close()
+		}()
 
 	} else {
 		f = os.Stdout
@@ -33,8 +44,9 @@ func ExecEMF(fdata []byte, fname string) {
 
 	err = png.Encode(f, img)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 // Convert converts an EMF input (either io.Reader or []byte) and returns the corresponding PNG output (either io.Reader or []byte).
