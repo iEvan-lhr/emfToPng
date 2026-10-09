@@ -621,19 +621,27 @@ func (r *bitmapRecord) Draw(ctx *context) {
 	if r.Type == EMR_BITBLT || r.Type == EMR_ALPHABLEND {
 		srcW, srcH = r.cxDest, r.cyDest
 	}
-	if srcW == 0 || srcH == 0 {
-		srcW, srcH = int32(img.Bounds().Dx()), int32(img.Bounds().Dy())
+	if srcW == 0 {
+		srcW = int32(img.Bounds().Dx())
+	}
+	if srcH == 0 {
+		srcH = int32(img.Bounds().Dy())
 	}
 	if r.Type == EMR_STRETCHDIBITS || r.Type == EMR_SETDIBITSTODEVICE || r.Type == EMR_TRANSPARENTBLT || r.Type == EMR_STRETCHBLT || r.Type == EMR_BITBLT || r.Type == EMR_ALPHABLEND {
 		srcRect := image.Rect(int(r.xSrc), int(r.ySrc), int(r.xSrc+srcW), int(r.ySrc+srcH))
 		srcRect = srcRect.Intersect(img.Bounds())
-		if !srcRect.Empty() {
-			img = imaging.Crop(img, srcRect)
+		if srcRect.Empty() {
+			return
 		}
+		img = imaging.Crop(img, srcRect)
 	}
 
 	left, top := transformPoint(ctx, float64(destX), float64(destY))
 	right, bottom := transformPoint(ctx, float64(destX+destW), float64(destY+destH))
+	// Sorting the destination bounds must not discard its direction. A
+	// negative source extent cancels a reversal on the same destination axis.
+	flipX := (right < left) != (srcW < 0)
+	flipY := (bottom < top) != (srcH < 0)
 	if right < left {
 		left, right = right, left
 	}
@@ -643,16 +651,29 @@ func (r *bitmapRecord) Draw(ctx *context) {
 	if right <= left || bottom <= top {
 		return
 	}
+	// Only these records carry a ROP3. AlphaBlend stores a BLENDFUNCTION in
+	// the same field, which must continue through alpha compositing instead.
+	usesROP := r.Type == EMR_BITBLT || r.Type == EMR_STRETCHBLT || r.Type == EMR_STRETCHDIBITS
+	rop := (r.BitBltRasterOperation >> 16) & 0xff
 	if img.Bounds().Dx() != right-left || img.Bounds().Dy() != bottom-top {
 		filter := imaging.CatmullRom
-		if r.BmiSrc.BitCount == BI_BITCOUNT_1 || r.BmiSrc.BitCount == BI_BITCOUNT_2 {
+		// A mask and its color image must use identical sampling for bitwise
+		// composition. Interpolating just the color image introduces fringes.
+		bitwiseROP := usesROP && (rop == 0x88 || rop == 0xee || rop == 0x66)
+		if r.BmiSrc.BitCount == BI_BITCOUNT_1 || r.BmiSrc.BitCount == BI_BITCOUNT_2 || bitwiseROP {
 			filter = imaging.NearestNeighbor
 		}
 		img = imaging.Resize(img, right-left, bottom-top, filter)
 	}
+	if flipX {
+		img = imaging.FlipH(img)
+	}
+	if flipY {
+		img = imaging.FlipV(img)
+	}
 
 	destination := image.Rect(left, top, right, bottom)
-	if r.BitBltRasterOperation != 0 {
+	if usesROP {
 		ctx.paintWithClip(func() { drawRasterOperation(ctx, destination, img, r.BitBltRasterOperation) })
 		return
 	}
